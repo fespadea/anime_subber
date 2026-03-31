@@ -41,11 +41,19 @@ class GeminiManager:
         if use_lite:
             self.models = ["gemini-flash-lite-latest"]
             
-    def generate(self, contents, config):
-        if self.api_exhausted:
+    def generate(self, contents, config, prefer_lite=False):
+        if self.api_exhausted or not self.models:
             return None
         
-        for model_name in self.models:
+        models_to_try = self.models
+        if prefer_lite:
+            # Reorder list to try lite models first for simpler tasks like OCR
+            lite_models = [m for m in self.models if "lite" in m]
+            standard_models = [m for m in self.models if "lite" not in m]
+            models_to_try = lite_models + standard_models
+        
+        # Iterate over a copy using list() so we can safely remove items from self.models
+        for model_name in list(models_to_try):
             try:
                 response = client.models.generate_content(
                     model=model_name,
@@ -56,14 +64,18 @@ class GeminiManager:
             except Exception as e:
                 err_str = str(e).lower()
                 if "429" in err_str or "quota" in err_str or "exhausted" in err_str:
-                    print(f"  [Gemini] Model {model_name} exhausted or rate-limited.")
+                    print(f"  [Gemini] Model {model_name} exhausted or rate-limited. Removing from rotation.")
+                    if model_name in self.models:
+                        self.models.remove(model_name)
                     continue
                 else:
                     print(f"  [Gemini] Error with {model_name}: {e}")
                     continue
         
-        print("\n[!] All available Gemini models exhausted their API quota. Suspending API calls.")
-        self.api_exhausted = True
+        if not self.models:
+            print("\n[!] All available Gemini models exhausted their API quota. Suspending API calls.")
+            self.api_exhausted = True
+            
         return None
 
 def format_srt_time(seconds):
@@ -412,7 +424,7 @@ def recheck_missing_dialogue(audio, whisper_segments, used_indices, gemini_manag
                     
     return new_subtitles
 
-def process_video_signs(video_file):
+def process_video_signs(video_file, gemini_manager):
     import easyocr
     print("\n--- Starting Vision Pass for On-Screen Text ---")
     print("Loading EasyOCR (This requires significant VRAM)...")
@@ -424,11 +436,12 @@ def process_video_signs(video_file):
     height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
     
     frame_interval = int(fps) 
+    scan_interval_sec = frame_interval / fps
     current_signs = []
     final_signs = []
     
     frame_count = 0
-    print("Scanning video frames for Japanese text...")
+    print("Scanning video frames for Japanese text (approx 1 frame/sec)...")
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret: break
@@ -438,6 +451,9 @@ def process_video_signs(video_file):
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             detected_texts = reader.readtext(gray, detail=1)
             
+            seen_this_frame = []
+            need_restore_position = False
+            
             for bbox, text, conf in detected_texts:
                 if conf < 0.6: continue
                 norm_t = normalize_text(text)
@@ -446,59 +462,191 @@ def process_video_signs(video_file):
                 found = False
                 for active in current_signs:
                     if fuzz.ratio(norm_t, active['norm_text']) > 80:
-                        active['end'] = current_time_sec + 1.0
+                        active['last_seen'] = current_time_sec
+                        active['bbox'] = bbox
+                        seen_this_frame.append(active)
                         found = True
                         break
                 
                 if not found:
-                    current_signs.append({
-                        'start': current_time_sec,
-                        'end': current_time_sec + 1.0,
+                    # Binary search backwards to find EXACT start time
+                    left_start = max(0.0, current_time_sec - scan_interval_sec - 0.1)
+                    right_start = current_time_sec
+                    
+                    for _ in range(4): # 4 steps = ~0.06s precision
+                        mid = (left_start + right_start) / 2.0
+                        cap.set(cv2.CAP_PROP_POS_MSEC, mid * 1000)
+                        ret_mid, f_mid = cap.read()
+                        if not ret_mid:
+                            right_start = mid
+                            continue
+                            
+                        g_mid = cv2.cvtColor(f_mid, cv2.COLOR_BGR2GRAY)
+                        tl, tr, br, bl = bbox
+                        x_min = max(0, int(min(tl[0], bl[0])) - 20)
+                        x_max = min(int(width), int(max(tr[0], br[0])) + 20)
+                        y_min = max(0, int(min(tl[1], tr[1])) - 20)
+                        y_max = min(int(height), int(max(bl[1], br[1])) + 20)
+                        
+                        if x_max <= x_min or y_max <= y_min:
+                            right_start = mid
+                            continue
+                            
+                        crop = g_mid[y_min:y_max, x_min:x_max]
+                        if crop.size == 0:
+                            right_start = mid
+                            continue
+                            
+                        det = reader.readtext(crop, detail=0)
+                        found_in_mid = False
+                        for dt in det:
+                            if fuzz.ratio(normalize_text(dt), norm_t) > 80:
+                                found_in_mid = True
+                                break
+                                
+                        if found_in_mid:
+                            right_start = mid 
+                        else:
+                            left_start = mid 
+                            
+                    new_sign = {
+                        'start': right_start,
+                        'last_seen': current_time_sec,
                         'ja_text': text,
                         'norm_text': norm_t,
+                        'bbox': bbox,
                         'pos': get_numpad_position(bbox, width, height)
-                    })
+                    }
+                    current_signs.append(new_sign)
+                    seen_this_frame.append(new_sign)
+                    need_restore_position = True
             
             for active in current_signs[:]:
-                if current_time_sec > active['end'] + 1.5:
+                if active not in seen_this_frame:
+                    # Binary search forwards to find EXACT end time
+                    left_end = active['last_seen']
+                    right_end = current_time_sec
+                    
+                    for _ in range(4):
+                        mid = (left_end + right_end) / 2.0
+                        cap.set(cv2.CAP_PROP_POS_MSEC, mid * 1000)
+                        ret_mid, f_mid = cap.read()
+                        if not ret_mid:
+                            right_end = mid
+                            continue
+                            
+                        g_mid = cv2.cvtColor(f_mid, cv2.COLOR_BGR2GRAY)
+                        tl, tr, br, bl = active['bbox']
+                        x_min = max(0, int(min(tl[0], bl[0])) - 20)
+                        x_max = min(int(width), int(max(tr[0], br[0])) + 20)
+                        y_min = max(0, int(min(tl[1], tr[1])) - 20)
+                        y_max = min(int(height), int(max(bl[1], br[1])) + 20)
+                        
+                        if x_max <= x_min or y_max <= y_min:
+                            right_end = mid
+                            continue
+                            
+                        crop = g_mid[y_min:y_max, x_min:x_max]
+                        if crop.size == 0:
+                            right_end = mid
+                            continue
+                            
+                        det = reader.readtext(crop, detail=0)
+                        found_in_mid = False
+                        for dt in det:
+                            if fuzz.ratio(normalize_text(dt), active['norm_text']) > 80:
+                                found_in_mid = True
+                                break
+                                
+                        if found_in_mid:
+                            left_end = mid
+                        else:
+                            right_end = mid
+                            
+                    active['end'] = left_end
                     final_signs.append(active)
                     current_signs.remove(active)
+                    need_restore_position = True
                     
+            if need_restore_position:
+                # Restore the sequential frame reading back to where we paused it
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count + 1)
+                
         frame_count += 1
         
     cap.release()
-    final_signs.extend(current_signs)
+    
+    # Sweep up any signs that were still on screen when the video ended
+    for active in current_signs:
+        active['end'] = active['last_seen']
+        final_signs.append(active)
+
+    # --- COMBINE AND SORT OVERLAPPING SIGNS ---
+    print("Combining overlapping on-screen text...")
+    combined_signs = []
+    
+    for sign in sorted(final_signs, key=lambda x: x['start']):
+        overlap_found = False
+        for comb in combined_signs:
+            if comb['pos'] == sign['pos']:
+                # If they overlap in time
+                start_max = max(comb['start'], sign['start'])
+                end_min = min(comb['end'], sign['end'])
+                if end_min > start_max:
+                    comb['start'] = min(comb['start'], sign['start'])
+                    comb['end'] = max(comb['end'], sign['end'])
+                    comb['lines'].append(sign)
+                    overlap_found = True
+                    break
+                    
+        if not overlap_found:
+            combined_signs.append({
+                'start': sign['start'],
+                'end': sign['end'],
+                'pos': sign['pos'],
+                'lines': [sign]
+            })
+            
+    # Sort them vertically based on their bounding box Y-coordinates
+    for comb in combined_signs:
+        comb['lines'].sort(key=lambda x: (x['bbox'][0][1] + x['bbox'][2][1]) / 2)
+        comb['ja_text'] = "\n".join([x['ja_text'] for x in comb['lines']])
     
     ocr_srt_blocks = []
-    if final_signs:
-        print(f"\nFound {len(final_signs)} on-screen signs. Batch translating via Gemini...")
+    if combined_signs:
+        print(f"\nFound {len(combined_signs)} grouped on-screen signs. Batch translating via Gemini...")
         batch_size = 50
-        for i in range(0, len(final_signs), batch_size):
-            batch = final_signs[i:i+batch_size]
+        for i in range(0, len(combined_signs), batch_size):
+            batch = combined_signs[i:i+batch_size]
             prompt = (
                 "You are an expert anime translator. Translate the following list of Japanese on-screen text to English. "
                 "Keep translations concise. Return ONLY a valid JSON array of strings in the exact same order as the input.\n"
+                "Note: Some items may contain multiple lines of text separated by newlines. Translate them as a single combined block.\n"
             )
             prompt += json.dumps([s['ja_text'] for s in batch], ensure_ascii=False)
             
             generation_config = types.GenerateContentConfig(temperature=0.1, response_mime_type="application/json")
             
             try:
-                response = client.models.generate_content(
-                    model="gemini-flash-latest",
+                response = gemini_manager.generate(
                     contents=[prompt],
-                    config=generation_config
+                    config=generation_config,
+                    prefer_lite=True
                 )
                 
-                translations = parse_llm_json(response.text)
-                for sign, en_text in zip(batch, translations):
-                    if en_text:
-                        ocr_srt_blocks.append({
-                            'start': sign['start'],
-                            'end': sign['end'],
-                            'text': f"[{en_text}]", 
-                            'pos': sign['pos']
-                        })
+                if response:
+                    translations = parse_llm_json(response.text)
+                    for sign, en_text in zip(batch, translations):
+                        if en_text:
+                            # Wrap each line in brackets so the viewer clearly knows it's an on-screen sign 
+                            formatted_text = "\n".join([f"[{line}]" for line in en_text.split('\n')]) if '\n' in en_text else f"[{en_text}]"
+                            
+                            ocr_srt_blocks.append({
+                                'start': sign['start'],
+                                'end': sign['end'],
+                                'text': formatted_text, 
+                                'pos': sign['pos']
+                            })
             except Exception as e:
                 print(f"Error translating signs batch: {e}")
                 
@@ -507,6 +655,7 @@ def process_video_signs(video_file):
 def process_anime_video(video_file, output_srt, run_ocr=False, ocr_only=False, strict_timing=False, use_lite=False):
     print(f"\nLoading {video_file}...")
     all_subtitles = []
+    gemini_manager = GeminiManager(use_lite=use_lite)
 
     if ocr_only:
         print("\n--- OCR Only Mode ---")
@@ -522,8 +671,6 @@ def process_anime_video(video_file, output_srt, run_ocr=False, ocr_only=False, s
         except Exception as e:
             print(f"Failed to extract audio: {e}")
             return
-
-        gemini_manager = GeminiManager(use_lite=use_lite)
         
         system_instruction = (
             "You are an expert anime translator. You will receive an audio clip. "
@@ -573,7 +720,7 @@ def process_anime_video(video_file, output_srt, run_ocr=False, ocr_only=False, s
             all_subtitles.extend(missing_subs)
 
     if run_ocr or ocr_only:
-        ocr_subtitles = process_video_signs(video_file)
+        ocr_subtitles = process_video_signs(video_file, gemini_manager)
         all_subtitles.extend(ocr_subtitles)
 
     if all_subtitles:
