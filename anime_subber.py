@@ -177,10 +177,136 @@ def refine_early_timestamps(start_time, end_time, full_audio, prev_end_time):
             pass 
     return start_time
 
-def align_audio_subs(gemini_data, whisper_segments, last_global_end_time, strict_timing=False, full_audio=None, is_orphan=False):
+def distribute_evenly(buffer, gap_start, gap_end, strict_timing, full_audio):
+    """Fallback to evenly distribute subtitles chronologically if all Whisper mappings fail."""
+    blocks = []
+    if not buffer: return blocks, gap_start
+    
+    duration = max(0.5, gap_end - gap_start)
+    step = duration / len(buffer)
+    
+    l_end = gap_start
+    for i, g_line in enumerate(buffer):
+        st = gap_start + (i * step)
+        en = st + step - 0.05
+        if strict_timing and full_audio is not None:
+            st = refine_early_timestamps(st, en, full_audio, l_end)
+        blocks.append({
+            'start': st,
+            'end': en,
+            'text': g_line.get("en", ""),
+            'pos': None
+        })
+        print(f"  [Recovered Evenly] [{format_srt_time(st).split(',')[0]} -> {format_srt_time(en).split(',')[0]}] {g_line.get('en', '')}")
+        l_end = en
+    return blocks, gap_end
+
+def map_1_to_1(buffer, w_segs, l_end, strict_timing, full_audio):
+    """Directly maps subtitles 1-to-1 when the counts perfectly match Whisper's detected audio spikes."""
+    blocks = []
+    used_idx = set()
+    for g_line, w_seg in zip(buffer, w_segs):
+        st = max(w_seg['start'], l_end + 0.001)
+        en = max(w_seg['end'], st + 0.5)
+        if strict_timing and full_audio is not None:
+            st = refine_early_timestamps(st, en, full_audio, l_end)
+        blocks.append({
+            'start': st,
+            'end': en,
+            'text': g_line.get("en", ""),
+            'pos': None
+        })
+        print(f"  [Recovered 1-to-1] [{format_srt_time(st).split(',')[0]} -> {format_srt_time(en).split(',')[0]}] {g_line.get('en', '')}")
+        l_end = en
+        if 'global_idx' in w_seg:
+            used_idx.add(w_seg['global_idx'])
+    return blocks, l_end, used_idx
+
+def handle_unmapped_gap(unmapped_buffer, gap_start, gap_end, whisper_segments, strict_timing, full_audio, last_global_end_time, whisper_model, video_file):
+    """Analyzes a time gap to run a secondary Whisper pass on hallucinated/unmapped sections."""
+    if not unmapped_buffer:
+        return [], last_global_end_time, set()
+        
+    gap_start = max(gap_start, last_global_end_time)
+    if gap_end <= gap_start:
+        gap_end = gap_start + (1.5 * len(unmapped_buffer))
+
+    start_ms = int(gap_start * 1000)
+    end_ms = int(gap_end * 1000)
+    
+    # Identify existing Whisper segments purely within this gap
+    gap_w_segs = []
+    for seg in whisper_segments:
+        overlap = min(gap_end, seg['end']) - max(gap_start, seg['start'])
+        if overlap > 0.05:
+            gap_w_segs.append(seg)
+
+    # Check 1-to-1 ratio against initial Whisper segments FIRST
+    if len(unmapped_buffer) == len(gap_w_segs) and len(gap_w_segs) > 0:
+        print(f"  [Recovered] 1-to-1 ratio found in gap. Direct mapping...")
+        return map_1_to_1(unmapped_buffer, gap_w_segs, last_global_end_time, strict_timing, full_audio)
+
+    # If the gap is too small or missing dependencies, skip the targeted Whisper pass
+    if end_ms - start_ms < 500 or whisper_model is None or video_file is None:
+        print("  [Recovered] Gap too small or dependencies missing. Distributing evenly.")
+        blocks, l_end = distribute_evenly(unmapped_buffer, gap_start, gap_end, strict_timing, full_audio)
+        return blocks, l_end, set()
+
+    print(f"  [Recovered] Ratio mismatch ({len(unmapped_buffer)} Gemini vs {len(gap_w_segs)} Whisper). Running targeted Whisper pass...")
+    
+    cache_file = os.path.splitext(video_file)[0] + f".whisper_gap_{start_ms}_{end_ms}.json"
+    new_w_segs = None
+    
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                new_w_segs = json.load(f)
+        except:
+            pass
+            
+    if new_w_segs is None:
+        gap_chunk = full_audio[start_ms:end_ms]
+        temp_path = f"temp_gap_{start_ms}_{end_ms}.wav"
+        gap_chunk.export(temp_path, format="wav")
+        try:
+            res = whisper_model.transcribe(temp_path, language="ja")
+            new_w_segs = res['segments']
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(new_w_segs, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"  [Whisper] Targeted pass failed: {e}")
+            new_w_segs = []
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+                
+    if new_w_segs:
+        # Offset new targeted segments to global time
+        adjusted_segs = []
+        for seg in new_w_segs:
+            adj = seg.copy()
+            adj['start'] += gap_start
+            adj['end'] += gap_start
+            adj['global_idx'] = -1
+            adjusted_segs.append(adj)
+            
+        print(f"  [Recovered] Secondary pass complete. Retrying fuzzy alignment over new gaps...")
+        # Recursively feed the clean text back into the standard fuzzy matching alignment function
+        blocks, l_end, gap_used = align_audio_subs(
+            unmapped_buffer, adjusted_segs, last_global_end_time, gap_end, 
+            strict_timing, full_audio, whisper_model, video_file, is_secondary_pass=True
+        )
+        return blocks, l_end, gap_used
+
+    print("  [Recovered] Targeted pass failed or yielded empty. Distributing evenly as last resort.")
+    blocks, l_end = distribute_evenly(unmapped_buffer, gap_start, gap_end, strict_timing, full_audio)
+    return blocks, l_end, set()
+
+def align_audio_subs(gemini_data, whisper_segments, last_global_end_time, chunk_end_time, strict_timing=False, full_audio=None, whisper_model=None, video_file=None, is_secondary_pass=False, is_orphan=False):
     srt_blocks = []
-    used_whisper_indices = set()
     last_match_idx = 0
+    unmapped_buffer = []
+    used_whisper_indices = set()
     
     for g_line in gemini_data:
         ja_text = g_line.get("ja", "")
@@ -196,8 +322,6 @@ def align_audio_subs(gemini_data, whisper_segments, last_global_end_time, strict
         best_start_idx = -1
         best_end_idx = -1
         
-        # Increased to 100. Whisper often generates dozens of tiny fragmented 
-        # noise/music segments. We need a large enough search window to jump over them.
         max_search_ahead = min(last_match_idx + 100, len(whisper_segments))
         
         for i in range(last_match_idx, max_search_ahead):
@@ -209,7 +333,16 @@ def align_audio_subs(gemini_data, whisper_segments, last_global_end_time, strict
                 
                 base_score = fuzz.partial_ratio(norm_ja, norm_combined)
                 size_ratio = min(len(norm_ja), len(norm_combined)) / max(len(norm_ja), len(norm_combined))
-                final_score = base_score * (size_ratio ** 0.5) 
+                
+                # Apply a dynamic time penalty instead of a flat segment penalty.
+                # This stops tiny phrases like "What?" from jumping 60-second music gaps and breaking the alignment,
+                # but allows long, unique sentences to safely jump across hallucinations.
+                time_gap = max(0.0, whisper_segments[i]['start'] - last_global_end_time)
+                time_penalty = 0.0
+                if time_gap > 5.0:
+                    time_penalty = ((time_gap - 5.0) * 1.5) / max(1, len(norm_ja))
+                    
+                final_score = (base_score * (size_ratio ** 0.5)) - time_penalty
                 
                 if final_score > best_match_score:
                     best_match_score = final_score
@@ -223,80 +356,30 @@ def align_audio_subs(gemini_data, whisper_segments, last_global_end_time, strict
             
             start_time = matched_start_seg['start']
             end_time = matched_end_seg['end']
-            
-            if strict_timing and full_audio is not None:
-                start_time = refine_early_timestamps(start_time, end_time, full_audio, last_global_end_time)
-            
-            if start_time < last_global_end_time - 0.5:
-                start_time = max(start_time, last_global_end_time + 0.001)
-                if start_time >= end_time:
-                    continue 
-                    
-            srt_blocks.append({
-                'start': start_time,
-                'end': end_time,
-                'text': en_text,
-                'pos': None 
-            })
-            
-            if not is_orphan:
-                print(f"[{format_srt_time(start_time).split(',')[0]}] {en_text}")
-                
-            used_whisper_indices.update(whisper_segments[idx]['global_idx'] for idx in range(best_start_idx, best_end_idx + 1))
-            last_global_end_time = end_time 
 
-    # --- PROPORTIONAL FALLBACK FOR ORPHANED BLOCKS ---
-    # If Whisper hallucinated garbage for this gap, fuzzy matching will fail for almost everything.
-    valid_gemini_count = sum(1 for g in gemini_data if normalize_text(g.get("ja", "")) and g.get("en") and "[NO SPEECH]" not in g.get("en"))
-    
-    if is_orphan and len(srt_blocks) < (valid_gemini_count * 0.5) and valid_gemini_count > 0:
-        print("  [Alignment] Low fuzzy match rate detected. Whisper likely hallucinated in this gap.")
-        print("  [Alignment] Engaging proportional time mapping for missing dialogue...")
-        
-        srt_blocks = []
-        used_whisper_indices = set(seg['global_idx'] for seg in whisper_segments) # Claim all segments in this block
-        
-        total_chars = sum(len(normalize_text(g.get("ja", ""))) for g in gemini_data if normalize_text(g.get("ja", "")) and g.get("en") and "[NO SPEECH]" not in g.get("en"))
-        valid_periods = [{'start': seg['start'], 'end': seg['end'], 'duration': seg['end'] - seg['start']} for seg in whisper_segments]
-        total_duration = sum(p['duration'] for p in valid_periods)
-        
-        current_period_idx = 0
-        current_time = valid_periods[0]['start'] if valid_periods else 0.0
-        
-        for g_line in gemini_data:
-            ja_text = g_line.get("ja", "")
-            en_text = g_line.get("en", "")
-            
-            if not ja_text or not en_text or "[NO SPEECH]" in en_text:
-                continue
+            # If we accumulated unmapped lines, process them before appending this successful match
+            if unmapped_buffer:
+                gap_start = max(last_global_end_time, whisper_segments[0]['start'] if whisper_segments else 0.0)
+                gap_end = start_time
                 
-            norm_ja = normalize_text(ja_text)
-            if not norm_ja: continue
-            
-            # Distribute time proportionally based on sentence length
-            fraction = len(norm_ja) / total_chars if total_chars > 0 else 1.0 / valid_gemini_count
-            allocated_time = fraction * total_duration
-            
-            start_time = current_time
-            time_left_to_consume = allocated_time
-            
-            # Step through the Whisper spikes, skipping the silences
-            while time_left_to_consume > 0 and current_period_idx < len(valid_periods):
-                period = valid_periods[current_period_idx]
-                time_remaining_in_period = period['end'] - current_time
-                
-                if time_left_to_consume < time_remaining_in_period - 0.001:
-                    current_time += time_left_to_consume
-                    time_left_to_consume = 0
+                if not is_secondary_pass and whisper_model is not None and video_file is not None:
+                    dist_blocks, last_global_end_time, gap_used_idx = handle_unmapped_gap(
+                        unmapped_buffer, gap_start, gap_end, whisper_segments, strict_timing, full_audio, last_global_end_time, whisper_model, video_file
+                    )
+                    used_whisper_indices.update(gap_used_idx)
                 else:
-                    time_left_to_consume -= time_remaining_in_period
-                    current_period_idx += 1
-                    if current_period_idx < len(valid_periods):
-                        current_time = valid_periods[current_period_idx]['start']
+                    gap_w_segs = []
+                    for seg in whisper_segments:
+                        overlap = min(gap_end, seg['end']) - max(gap_start, seg['start'])
+                        if overlap > 0.05:
+                            gap_w_segs.append(seg)
+                    if len(unmapped_buffer) == len(gap_w_segs) and len(gap_w_segs) > 0:
+                        dist_blocks, last_global_end_time, gap_used_idx = map_1_to_1(unmapped_buffer, gap_w_segs, last_global_end_time, strict_timing, full_audio)
+                        used_whisper_indices.update(gap_used_idx)
                     else:
-                        current_time = period['end']
-                        
-            end_time = current_time
+                        dist_blocks, last_global_end_time = distribute_evenly(unmapped_buffer, gap_start, gap_end, strict_timing, full_audio)
+                srt_blocks.extend(dist_blocks)
+                unmapped_buffer = []
             
             if strict_timing and full_audio is not None:
                 start_time = refine_early_timestamps(start_time, end_time, full_audio, last_global_end_time)
@@ -312,12 +395,40 @@ def align_audio_subs(gemini_data, whisper_segments, last_global_end_time, strict
                 'text': en_text,
                 'pos': None 
             })
-            print(f"  [{format_srt_time(start_time).split(',')[0]} -> {format_srt_time(end_time).split(',')[0]}] {en_text}")
+            
+            prefix = "  [Recovered] " if is_secondary_pass or is_orphan else ""
+            print(f"{prefix}[{format_srt_time(start_time).split(',')[0]} -> {format_srt_time(end_time).split(',')[0]}] {en_text}")
+            used_whisper_indices.update(whisper_segments[idx].get('global_idx', -1) for idx in range(best_start_idx, best_end_idx + 1))
             last_global_end_time = end_time 
+        else:
+            # Whisper hallucinated or missed this. Buffer it to be mapped into the next available gap.
+            unmapped_buffer.append(g_line)
+
+    # Handle any trailing unmapped lines that fell at the very end of the chunk
+    if unmapped_buffer:
+        gap_start = last_global_end_time
+        gap_end = max(chunk_end_time, gap_start + (1.5 * len(unmapped_buffer)))
+        if not is_secondary_pass and whisper_model is not None and video_file is not None:
+            dist_blocks, last_global_end_time, gap_used_idx = handle_unmapped_gap(
+                unmapped_buffer, gap_start, gap_end, whisper_segments, strict_timing, full_audio, last_global_end_time, whisper_model, video_file
+            )
+            used_whisper_indices.update(gap_used_idx)
+        else:
+            gap_w_segs = []
+            for seg in whisper_segments:
+                overlap = min(gap_end, seg['end']) - max(gap_start, seg['start'])
+                if overlap > 0.05:
+                    gap_w_segs.append(seg)
+            if len(unmapped_buffer) == len(gap_w_segs) and len(gap_w_segs) > 0:
+                dist_blocks, last_global_end_time, gap_used_idx = map_1_to_1(unmapped_buffer, gap_w_segs, last_global_end_time, strict_timing, full_audio)
+                used_whisper_indices.update(gap_used_idx)
+            else:
+                dist_blocks, last_global_end_time = distribute_evenly(unmapped_buffer, gap_start, gap_end, strict_timing, full_audio)
+        srt_blocks.extend(dist_blocks)
 
     return srt_blocks, last_global_end_time, used_whisper_indices
 
-def run_whisper_pass(audio, video_file):
+def run_whisper_pass(audio, video_file, whisper_model):
     whisper_cache_file = os.path.splitext(video_file)[0] + ".whisper.json"
     
     if os.path.exists(whisper_cache_file):
@@ -325,9 +436,6 @@ def run_whisper_pass(audio, video_file):
         with open(whisper_cache_file, "r", encoding="utf-8") as f:
             segments = json.load(f)
     else:
-        print("[Whisper] Loading local model (large) for perfect timestamping...")
-        whisper_model = whisper.load_model("large", device="cuda")
-        
         temp_full_audio = "temp_full_audio.wav"
         audio.export(temp_full_audio, format="wav")
         
@@ -390,7 +498,10 @@ def run_gemini_pass(audio, video_file, gemini_manager, config):
                     except json.JSONDecodeError as e:
                         if "Extra data" in e.msg:
                             clean_text = raw_text[:e.pos].strip()
-                            gemini_data = json.loads(clean_text)
+                            try:
+                                gemini_data = json.loads(clean_text)
+                            except Exception:
+                                gemini_data = parse_llm_json(raw_text)
                         else:
                             gemini_data = parse_llm_json(raw_text)
                             
@@ -412,14 +523,15 @@ def run_gemini_pass(audio, video_file, gemini_manager, config):
             
     return gemini_chunks_data
 
-def recheck_missing_dialogue(audio, whisper_segments, used_indices, gemini_manager, config, strict_timing, video_file):
-    print("\n--- Scanning for Missing Dialogue ---")
+def recheck_missing_dialogue(audio, whisper_segments, used_indices, gemini_manager, config, strict_timing, video_file, whisper_model):
+    """Gathers unused Whisper segments and sends them back to Gemini to check for missed translations."""
+    print("\n--- Scanning for Missing Dialogue (Orphaned Whisper Segments) ---")
     new_subtitles = []
     orphan_blocks = []
     current_block = []
     
     for seg in whisper_segments:
-        if seg['global_idx'] not in used_indices:
+        if seg.get('global_idx', -1) not in used_indices:
             text = normalize_text(seg['text'])
             if len(text) > 1:  # Contains actual content, not just music symbols
                 current_block.append(seg)
@@ -431,7 +543,7 @@ def recheck_missing_dialogue(audio, whisper_segments, used_indices, gemini_manag
     if current_block:
         orphan_blocks.append(current_block)
         
-    chunk_sub_counters = {}  # Tracks the Y counter for each X chunk
+    chunk_sub_counters = {}  
         
     for block in orphan_blocks:
         start_seg = block[0]
@@ -483,7 +595,10 @@ def recheck_missing_dialogue(audio, whisper_segments, used_indices, gemini_manag
                     except json.JSONDecodeError as e:
                         if "Extra data" in e.msg:
                             clean_text = raw_text[:e.pos].strip()
-                            gemini_data = json.loads(clean_text)
+                            try:
+                                gemini_data = json.loads(clean_text)
+                            except Exception:
+                                gemini_data = parse_llm_json(raw_text)
                         else:
                             gemini_data = parse_llm_json(raw_text)
                             
@@ -493,8 +608,10 @@ def recheck_missing_dialogue(audio, whisper_segments, used_indices, gemini_manag
                             json.dump(gemini_data, f, ensure_ascii=False, indent=2)
             
             if gemini_data:
-                # Pass is_orphan=True to enable the proportional mapping fallback if fuzzy matching fails
-                subs, _, _ = align_audio_subs(gemini_data, block, -1.0, strict_timing, audio, is_orphan=True)
+                # Feed the orphaned block back into standard fuzzy matching
+                subs, _, _ = align_audio_subs(
+                    gemini_data, block, block[0]['start'] - 0.1, end_seg['end'], strict_timing=strict_timing, full_audio=audio, whisper_model=whisper_model, video_file=video_file, is_orphan=True
+                )
                 new_subtitles.extend(subs)
                     
     return new_subtitles
@@ -819,9 +936,12 @@ def process_anime_video(video_file, output_srt, run_ocr=False, ocr_only=False, s
         )
 
         print("\n--- Starting Parallel Audio Processing ---")
+        print("Loading local Whisper model (large) for perfect timestamping...")
+        whisper_model = whisper.load_model("large", device="cuda")
+        
         # Run Whisper and Gemini tasks in parallel to save time
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            future_whisper = executor.submit(run_whisper_pass, audio, video_file)
+            future_whisper = executor.submit(run_whisper_pass, audio, video_file, whisper_model)
             future_gemini = executor.submit(run_gemini_pass, audio, video_file, gemini_manager, generation_config)
             
             global_whisper_segments = future_whisper.result()
@@ -840,13 +960,13 @@ def process_anime_video(video_file, output_srt, run_ocr=False, ocr_only=False, s
                             seg['end'] <= (end_sec + 15)]
             
             chunk_srt_lines, last_global_end_time, chunk_used_idx = align_audio_subs(
-                gemini_data, chunk_w_segs, last_global_end_time, strict_timing, audio
+                gemini_data, chunk_w_segs, last_global_end_time, end_sec, strict_timing, audio, whisper_model, video_file
             )
             all_subtitles.extend(chunk_srt_lines)
             used_whisper_indices.update(chunk_used_idx)
-            
-        # Re-check orphaned Whisper segments
-        missing_subs = recheck_missing_dialogue(audio, global_whisper_segments, used_whisper_indices, gemini_manager, generation_config, strict_timing, video_file)
+
+        # Re-check orphaned Whisper segments (Feature A)
+        missing_subs = recheck_missing_dialogue(audio, global_whisper_segments, used_whisper_indices, gemini_manager, generation_config, strict_timing, video_file, whisper_model)
         if missing_subs:
             all_subtitles.extend(missing_subs)
 
