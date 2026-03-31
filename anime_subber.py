@@ -38,9 +38,9 @@ class GeminiManager:
     """Handles API calls, quota fallbacks, and the kill-switch if limits are exceeded."""
     def __init__(self, use_lite=False):
         self.api_exhausted = False
-        self.models = ["gemini-flash-latest", "gemini-flash-lite-latest"]
+        self.models = ["gemini-flash-latest", "gemini-3.1-flash-lite-preview", "gemini-flash-lite-latest"]
         if use_lite:
-            self.models = ["gemini-flash-lite-latest"]
+            self.models = ["gemini-3.1-flash-lite-preview", "gemini-flash-lite-latest"]
             
     def generate(self, contents, config, prefer_lite=False):
         if self.api_exhausted or not self.models:
@@ -620,37 +620,71 @@ def process_video_signs(video_file, gemini_manager):
         batch_size = 50
         for i in range(0, len(combined_signs), batch_size):
             batch = combined_signs[i:i+batch_size]
-            prompt = (
-                "You are an expert anime translator. Translate the following list of Japanese on-screen text to English. "
-                "Keep translations concise. Return ONLY a valid JSON array of strings in the exact same order as the input.\n"
-                "Note: Some items may contain multiple lines of text separated by newlines. Translate them as a single combined block.\n"
-            )
-            prompt += json.dumps([s['ja_text'] for s in batch], ensure_ascii=False)
+            batch_idx = i // batch_size
+            ocr_cache_file = os.path.splitext(video_file)[0] + f".gemini_ocr_batch_{batch_idx}.json"
+            translations = None
             
-            generation_config = types.GenerateContentConfig(temperature=0.1, response_mime_type="application/json")
+            if os.path.exists(ocr_cache_file):
+                print(f"  [Gemini] Loading cached OCR translation from {ocr_cache_file}...")
+                try:
+                    with open(ocr_cache_file, "r", encoding="utf-8") as f:
+                        translations = json.load(f)
+                except Exception as e:
+                    print(f"  [Gemini] Error loading OCR cache: {e}. Re-running...")
             
-            try:
-                response = gemini_manager.generate(
-                    contents=[prompt],
-                    config=generation_config,
-                    prefer_lite=True
+            if not translations and not gemini_manager.api_exhausted:
+                # Structure input with IDs to prevent offset bugs
+                input_data = [{"id": idx, "ja": s['ja_text']} for idx, s in enumerate(batch)]
+                prompt = (
+                    "You are an expert anime translator. Translate the following Japanese on-screen text to English. "
+                    "Keep translations concise. You MUST respond ONLY with a valid JSON array of objects. "
+                    "Each object must have the exact same 'id' as the input, and an 'en' key with the English translation.\n"
+                    "Example: [{\"id\": 0, \"en\": \"Store\"}, {\"id\": 1, \"en\": \"Danger\"}]\n"
+                    "Note: Some items may contain multiple lines of text. Translate them as a single combined block.\n"
                 )
+                prompt += json.dumps(input_data, ensure_ascii=False)
                 
-                if response:
-                    translations = parse_llm_json(response.text)
-                    for sign, en_text in zip(batch, translations):
-                        if en_text:
-                            # Wrap each line in brackets so the viewer clearly knows it's an on-screen sign 
-                            formatted_text = "\n".join([f"[{line}]" for line in en_text.split('\n')]) if '\n' in en_text else f"[{en_text}]"
-                            
-                            ocr_srt_blocks.append({
-                                'start': sign['start'],
-                                'end': sign['end'],
-                                'text': formatted_text, 
-                                'pos': sign['pos']
-                            })
-            except Exception as e:
-                print(f"Error translating signs batch: {e}")
+                generation_config = types.GenerateContentConfig(temperature=0.1, response_mime_type="application/json")
+                
+                try:
+                    response = gemini_manager.generate(
+                        contents=[prompt],
+                        config=generation_config,
+                        prefer_lite=True
+                    )
+                    
+                    if response:
+                        translations = parse_llm_json(response.text)
+                        if translations:
+                            print(f"  [Gemini] Caching OCR translation to {ocr_cache_file}...")
+                            with open(ocr_cache_file, "w", encoding="utf-8") as f:
+                                json.dump(translations, f, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    print(f"Error translating signs batch: {e}")
+            
+            if translations:
+                # Map translations by ID to gracefully handle Gemini skipping/dropping items
+                trans_map = {}
+                if isinstance(translations, list) and len(translations) > 0:
+                    if isinstance(translations[0], str):
+                        # Legacy string array fallback (just in case you load an old cache file)
+                        trans_map = {idx: text for idx, text in enumerate(translations)}
+                    else:
+                        # New robust object mapping
+                        trans_map = {item.get('id', -1): item.get('en', '') for item in translations if isinstance(item, dict)}
+
+                for idx, sign in enumerate(batch):
+                    en_text = trans_map.get(idx, "")
+                    if en_text and "[NO SPEECH]" not in en_text:
+                        # Wrap each line in brackets so the viewer clearly knows it's an on-screen sign 
+                        formatted_text = "\n".join([f"[{line}]" for line in en_text.split('\n')]) if '\n' in en_text else f"[{en_text}]"
+                        
+                        ocr_srt_blocks.append({
+                            'start': sign['start'],
+                            'end': sign['end'],
+                            'text': formatted_text, 
+                            'pos': sign['pos']
+                        })
                 
     return ocr_srt_blocks
 
