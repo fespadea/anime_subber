@@ -11,6 +11,7 @@ import shutil
 import concurrent.futures
 from pydub import AudioSegment
 from thefuzz import fuzz
+from tqdm import tqdm
 
 from google import genai
 from google.genai import types
@@ -434,6 +435,7 @@ def process_video_signs(video_file, gemini_manager):
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
     height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
     frame_interval = int(fps) 
     scan_interval_sec = frame_interval / fps
@@ -442,14 +444,13 @@ def process_video_signs(video_file, gemini_manager):
     
     frame_count = 0
     print("Scanning video frames for Japanese text (approx 1 frame/sec)...")
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret: break
-            
-        if frame_count % frame_interval == 0:
-            current_time_sec = frame_count / fps
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            detected_texts = reader.readtext(gray, detail=1)
+    with tqdm(total=total_frames, desc="OCR Scanning", unit="frame") as pbar:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret: break
+                
+            if frame_count % frame_interval == 0:
+                current_time_sec = frame_count / fps
             
             seen_this_frame = []
             need_restore_position = False
@@ -572,7 +573,8 @@ def process_video_signs(video_file, gemini_manager):
                 # Restore the sequential frame reading back to where we paused it
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count + 1)
                 
-        frame_count += 1
+            frame_count += 1
+            pbar.update(1)
         
     cap.release()
     
