@@ -177,7 +177,7 @@ def refine_early_timestamps(start_time, end_time, full_audio, prev_end_time):
             pass 
     return start_time
 
-def align_audio_subs(gemini_data, whisper_segments, last_global_end_time, strict_timing=False, full_audio=None):
+def align_audio_subs(gemini_data, whisper_segments, last_global_end_time, strict_timing=False, full_audio=None, is_orphan=False):
     srt_blocks = []
     used_whisper_indices = set()
     last_match_idx = 0
@@ -239,10 +239,82 @@ def align_audio_subs(gemini_data, whisper_segments, last_global_end_time, strict
                 'pos': None 
             })
             
-            # Track which global indices were used
+            if not is_orphan:
+                print(f"[{format_srt_time(start_time).split(',')[0]}] {en_text}")
+                
             used_whisper_indices.update(whisper_segments[idx]['global_idx'] for idx in range(best_start_idx, best_end_idx + 1))
             last_global_end_time = end_time 
+
+    # --- PROPORTIONAL FALLBACK FOR ORPHANED BLOCKS ---
+    # If Whisper hallucinated garbage for this gap, fuzzy matching will fail for almost everything.
+    valid_gemini_count = sum(1 for g in gemini_data if normalize_text(g.get("ja", "")) and g.get("en") and "[NO SPEECH]" not in g.get("en"))
+    
+    if is_orphan and len(srt_blocks) < (valid_gemini_count * 0.5) and valid_gemini_count > 0:
+        print("  [Alignment] Low fuzzy match rate detected. Whisper likely hallucinated in this gap.")
+        print("  [Alignment] Engaging proportional time mapping for missing dialogue...")
+        
+        srt_blocks = []
+        used_whisper_indices = set(seg['global_idx'] for seg in whisper_segments) # Claim all segments in this block
+        
+        total_chars = sum(len(normalize_text(g.get("ja", ""))) for g in gemini_data if normalize_text(g.get("ja", "")) and g.get("en") and "[NO SPEECH]" not in g.get("en"))
+        valid_periods = [{'start': seg['start'], 'end': seg['end'], 'duration': seg['end'] - seg['start']} for seg in whisper_segments]
+        total_duration = sum(p['duration'] for p in valid_periods)
+        
+        current_period_idx = 0
+        current_time = valid_periods[0]['start'] if valid_periods else 0.0
+        
+        for g_line in gemini_data:
+            ja_text = g_line.get("ja", "")
+            en_text = g_line.get("en", "")
             
+            if not ja_text or not en_text or "[NO SPEECH]" in en_text:
+                continue
+                
+            norm_ja = normalize_text(ja_text)
+            if not norm_ja: continue
+            
+            # Distribute time proportionally based on sentence length
+            fraction = len(norm_ja) / total_chars if total_chars > 0 else 1.0 / valid_gemini_count
+            allocated_time = fraction * total_duration
+            
+            start_time = current_time
+            time_left_to_consume = allocated_time
+            
+            # Step through the Whisper spikes, skipping the silences
+            while time_left_to_consume > 0 and current_period_idx < len(valid_periods):
+                period = valid_periods[current_period_idx]
+                time_remaining_in_period = period['end'] - current_time
+                
+                if time_left_to_consume < time_remaining_in_period - 0.001:
+                    current_time += time_left_to_consume
+                    time_left_to_consume = 0
+                else:
+                    time_left_to_consume -= time_remaining_in_period
+                    current_period_idx += 1
+                    if current_period_idx < len(valid_periods):
+                        current_time = valid_periods[current_period_idx]['start']
+                    else:
+                        current_time = period['end']
+                        
+            end_time = current_time
+            
+            if strict_timing and full_audio is not None:
+                start_time = refine_early_timestamps(start_time, end_time, full_audio, last_global_end_time)
+            
+            if start_time < last_global_end_time - 0.5:
+                start_time = max(start_time, last_global_end_time + 0.001)
+                if start_time >= end_time:
+                    continue 
+                    
+            srt_blocks.append({
+                'start': start_time,
+                'end': end_time,
+                'text': en_text,
+                'pos': None 
+            })
+            print(f"  [{format_srt_time(start_time).split(',')[0]} -> {format_srt_time(end_time).split(',')[0]}] {en_text}")
+            last_global_end_time = end_time 
+
     return srt_blocks, last_global_end_time, used_whisper_indices
 
 def run_whisper_pass(audio, video_file):
@@ -377,7 +449,8 @@ def recheck_missing_dialogue(audio, whisper_segments, used_indices, gemini_manag
             gemini_data = None
             
             time_start_str = format_srt_time(start_seg['start']).split(',')[0]
-            print(f"Targeting missing dialogue at {time_start_str} (Chunk {chunk_x}.{chunk_y})...")
+            time_end_str = format_srt_time(end_seg['end']).split(',')[0]
+            print(f"Targeting missing dialogue at {time_start_str} to {time_end_str} (Chunk {chunk_x}.{chunk_y})...")
             
             if os.path.exists(gemini_cache_file):
                 print(f"  [Gemini] Loading cached missing dialogue translation from {gemini_cache_file}...")
@@ -420,202 +493,222 @@ def recheck_missing_dialogue(audio, whisper_segments, used_indices, gemini_manag
                             json.dump(gemini_data, f, ensure_ascii=False, indent=2)
             
             if gemini_data:
-                subs, _, _ = align_audio_subs(gemini_data, block, -1.0, strict_timing, audio)
+                # Pass is_orphan=True to enable the proportional mapping fallback if fuzzy matching fails
+                subs, _, _ = align_audio_subs(gemini_data, block, -1.0, strict_timing, audio, is_orphan=True)
                 new_subtitles.extend(subs)
                     
     return new_subtitles
 
 def process_video_signs(video_file, gemini_manager):
-    import easyocr
-    print("\n--- Starting Vision Pass for On-Screen Text ---")
-    print("Loading EasyOCR (This requires significant VRAM)...")
-    reader = easyocr.Reader(['ja'], gpu=True)
+    ocr_signs_cache_file = os.path.splitext(video_file)[0] + ".ocr_signs.json"
+    combined_signs = None
     
-    cap = cv2.VideoCapture(video_file)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-    height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    frame_interval = int(fps) 
-    scan_interval_sec = frame_interval / fps
-    current_signs = []
-    final_signs = []
-    
-    frame_count = 0
-    print("Scanning video frames for Japanese text (approx 1 frame/sec)...")
-    with tqdm(total=total_frames, desc="OCR Scanning", unit="frame") as pbar:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret: break
-                
-            if frame_count % frame_interval == 0:
-                current_time_sec = frame_count / fps
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                detected_texts = reader.readtext(gray, detail=1)
-                
-                seen_this_frame = []
-                need_restore_position = False
-                
-                for bbox, text, conf in detected_texts:
-                    if conf < 0.6: continue
-                    norm_t = normalize_text(text)
-                    if len(norm_t) < 2: continue 
-                    
-                    found = False
-                    for active in current_signs:
-                        if fuzz.ratio(norm_t, active['norm_text']) > 80:
-                            active['last_seen'] = current_time_sec
-                            active['bbox'] = bbox
-                            seen_this_frame.append(active)
-                            found = True
-                            break
-                    
-                    if not found:
-                        # Binary search backwards to find EXACT start time
-                        left_start = max(0.0, current_time_sec - scan_interval_sec - 0.1)
-                        right_start = current_time_sec
-                        
-                        for _ in range(4): # 4 steps = ~0.06s precision
-                            mid = (left_start + right_start) / 2.0
-                            cap.set(cv2.CAP_PROP_POS_MSEC, mid * 1000)
-                            ret_mid, f_mid = cap.read()
-                            if not ret_mid:
-                                right_start = mid
-                                continue
-                                
-                            g_mid = cv2.cvtColor(f_mid, cv2.COLOR_BGR2GRAY)
-                            tl, tr, br, bl = bbox
-                            x_min = max(0, int(min(tl[0], bl[0])) - 20)
-                            x_max = min(int(width), int(max(tr[0], br[0])) + 20)
-                            y_min = max(0, int(min(tl[1], tr[1])) - 20)
-                            y_max = min(int(height), int(max(bl[1], br[1])) + 20)
-                            
-                            if x_max <= x_min or y_max <= y_min:
-                                right_start = mid
-                                continue
-                                
-                            crop = g_mid[y_min:y_max, x_min:x_max]
-                            if crop.size == 0:
-                                right_start = mid
-                                continue
-                                
-                            det = reader.readtext(crop, detail=0)
-                            found_in_mid = False
-                            for dt in det:
-                                if fuzz.ratio(normalize_text(dt), norm_t) > 80:
-                                    found_in_mid = True
-                                    break
-                                    
-                            if found_in_mid:
-                                right_start = mid 
-                            else:
-                                left_start = mid 
-                                
-                        new_sign = {
-                            'start': right_start,
-                            'last_seen': current_time_sec,
-                            'ja_text': text,
-                            'norm_text': norm_t,
-                            'bbox': bbox,
-                            'pos': get_numpad_position(bbox, width, height)
-                        }
-                        current_signs.append(new_sign)
-                        seen_this_frame.append(new_sign)
-                        need_restore_position = True
-                
-                for active in current_signs[:]:
-                    if active not in seen_this_frame:
-                        # Binary search forwards to find EXACT end time
-                        left_end = active['last_seen']
-                        right_end = current_time_sec
-                        
-                        for _ in range(4):
-                            mid = (left_end + right_end) / 2.0
-                            cap.set(cv2.CAP_PROP_POS_MSEC, mid * 1000)
-                            ret_mid, f_mid = cap.read()
-                            if not ret_mid:
-                                right_end = mid
-                                continue
-                                
-                            g_mid = cv2.cvtColor(f_mid, cv2.COLOR_BGR2GRAY)
-                            tl, tr, br, bl = active['bbox']
-                            x_min = max(0, int(min(tl[0], bl[0])) - 20)
-                            x_max = min(int(width), int(max(tr[0], br[0])) + 20)
-                            y_min = max(0, int(min(tl[1], tr[1])) - 20)
-                            y_max = min(int(height), int(max(bl[1], br[1])) + 20)
-                            
-                            if x_max <= x_min or y_max <= y_min:
-                                right_end = mid
-                                continue
-                                
-                            crop = g_mid[y_min:y_max, x_min:x_max]
-                            if crop.size == 0:
-                                right_end = mid
-                                continue
-                                
-                            det = reader.readtext(crop, detail=0)
-                            found_in_mid = False
-                            for dt in det:
-                                if fuzz.ratio(normalize_text(dt), active['norm_text']) > 80:
-                                    found_in_mid = True
-                                    break
-                                    
-                            if found_in_mid:
-                                left_end = mid
-                            else:
-                                right_end = mid
-                                
-                        active['end'] = left_end
-                        final_signs.append(active)
-                        current_signs.remove(active)
-                        need_restore_position = True
-                        
-                if need_restore_position:
-                    # Restore the sequential frame reading back to where we paused it
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count + 1)
-                    
-            frame_count += 1
-            pbar.update(1)
-        
-    cap.release()
-    
-    # Sweep up any signs that were still on screen when the video ended
-    for active in current_signs:
-        active['end'] = active['last_seen']
-        final_signs.append(active)
+    if os.path.exists(ocr_signs_cache_file):
+        print(f"\n--- Vision Pass: Loading cached OCR detections from {ocr_signs_cache_file} ---")
+        try:
+            with open(ocr_signs_cache_file, "r", encoding="utf-8") as f:
+                combined_signs = json.load(f)
+        except Exception as e:
+            print(f"Error loading OCR detection cache: {e}. Re-running vision pass...")
+            combined_signs = None
 
-    # --- COMBINE AND SORT OVERLAPPING SIGNS ---
-    print("Combining overlapping on-screen text...")
-    combined_signs = []
-    
-    for sign in sorted(final_signs, key=lambda x: x['start']):
-        overlap_found = False
-        for comb in combined_signs:
-            if comb['pos'] == sign['pos']:
-                # If they overlap in time
-                start_max = max(comb['start'], sign['start'])
-                end_min = min(comb['end'], sign['end'])
-                if end_min > start_max:
-                    comb['start'] = min(comb['start'], sign['start'])
-                    comb['end'] = max(comb['end'], sign['end'])
-                    comb['lines'].append(sign)
-                    overlap_found = True
-                    break
+    if not combined_signs:
+        import easyocr
+        print("\n--- Starting Vision Pass for On-Screen Text ---")
+        print("Loading EasyOCR (This requires significant VRAM)...")
+        reader = easyocr.Reader(['ja'], gpu=True)
+        
+        cap = cv2.VideoCapture(video_file)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        frame_interval = int(fps) 
+        scan_interval_sec = frame_interval / fps
+        current_signs = []
+        final_signs = []
+        
+        frame_count = 0
+        print("Scanning video frames for Japanese text (approx 1 frame/sec)...")
+        with tqdm(total=total_frames, desc="OCR Scanning", unit="frame") as pbar:
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret: break
                     
-        if not overlap_found:
-            combined_signs.append({
-                'start': sign['start'],
-                'end': sign['end'],
-                'pos': sign['pos'],
-                'lines': [sign]
-            })
+                if frame_count % frame_interval == 0:
+                    current_time_sec = frame_count / fps
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    detected_texts = reader.readtext(gray, detail=1)
+                    
+                    seen_this_frame = []
+                    need_restore_position = False
+                    
+                    for bbox, text, conf in detected_texts:
+                        if conf < 0.6: continue
+                        norm_t = normalize_text(text)
+                        if len(norm_t) < 2: continue 
+                        
+                        found = False
+                        for active in current_signs:
+                            if fuzz.ratio(norm_t, active['norm_text']) > 80:
+                                active['last_seen'] = float(current_time_sec)
+                                # Cast coordinate points to basic Python floats so they are JSON serializable
+                                active['bbox'] = [[float(p[0]), float(p[1])] for p in bbox]
+                                seen_this_frame.append(active)
+                                found = True
+                                break
+                        
+                        if not found:
+                            # Binary search backwards to find EXACT start time
+                            left_start = max(0.0, current_time_sec - scan_interval_sec - 0.1)
+                            right_start = current_time_sec
+                            
+                            for _ in range(4): # 4 steps = ~0.06s precision
+                                mid = (left_start + right_start) / 2.0
+                                cap.set(cv2.CAP_PROP_POS_MSEC, mid * 1000)
+                                ret_mid, f_mid = cap.read()
+                                if not ret_mid:
+                                    right_start = mid
+                                    continue
+                                    
+                                g_mid = cv2.cvtColor(f_mid, cv2.COLOR_BGR2GRAY)
+                                tl, tr, br, bl = bbox
+                                x_min = max(0, int(min(tl[0], bl[0])) - 20)
+                                x_max = min(int(width), int(max(tr[0], br[0])) + 20)
+                                y_min = max(0, int(min(tl[1], tr[1])) - 20)
+                                y_max = min(int(height), int(max(bl[1], br[1])) + 20)
+                                
+                                if x_max <= x_min or y_max <= y_min:
+                                    right_start = mid
+                                    continue
+                                    
+                                crop = g_mid[y_min:y_max, x_min:x_max]
+                                if crop.size == 0:
+                                    right_start = mid
+                                    continue
+                                    
+                                det = reader.readtext(crop, detail=0)
+                                found_in_mid = False
+                                for dt in det:
+                                    if fuzz.ratio(normalize_text(dt), norm_t) > 80:
+                                        found_in_mid = True
+                                        break
+                                        
+                                if found_in_mid:
+                                    right_start = mid 
+                                else:
+                                    left_start = mid 
+                                    
+                            new_sign = {
+                                'start': float(right_start),
+                                'last_seen': float(current_time_sec),
+                                'ja_text': str(text),
+                                'norm_text': str(norm_t),
+                                'bbox': [[float(p[0]), float(p[1])] for p in bbox],
+                                'pos': int(get_numpad_position(bbox, width, height))
+                            }
+                            current_signs.append(new_sign)
+                            seen_this_frame.append(new_sign)
+                            need_restore_position = True
+                    
+                    for active in current_signs[:]:
+                        if active not in seen_this_frame:
+                            # Binary search forwards to find EXACT end time
+                            left_end = active['last_seen']
+                            right_end = current_time_sec
+                            
+                            for _ in range(4):
+                                mid = (left_end + right_end) / 2.0
+                                cap.set(cv2.CAP_PROP_POS_MSEC, mid * 1000)
+                                ret_mid, f_mid = cap.read()
+                                if not ret_mid:
+                                    right_end = mid
+                                    continue
+                                    
+                                g_mid = cv2.cvtColor(f_mid, cv2.COLOR_BGR2GRAY)
+                                tl, tr, br, bl = active['bbox']
+                                x_min = max(0, int(min(tl[0], bl[0])) - 20)
+                                x_max = min(int(width), int(max(tr[0], br[0])) + 20)
+                                y_min = max(0, int(min(tl[1], tr[1])) - 20)
+                                y_max = min(int(height), int(max(bl[1], br[1])) + 20)
+                                
+                                if x_max <= x_min or y_max <= y_min:
+                                    right_end = mid
+                                    continue
+                                    
+                                crop = g_mid[y_min:y_max, x_min:x_max]
+                                if crop.size == 0:
+                                    right_end = mid
+                                    continue
+                                    
+                                det = reader.readtext(crop, detail=0)
+                                found_in_mid = False
+                                for dt in det:
+                                    if fuzz.ratio(normalize_text(dt), active['norm_text']) > 80:
+                                        found_in_mid = True
+                                        break
+                                        
+                                if found_in_mid:
+                                    left_end = mid
+                                else:
+                                    right_end = mid
+                                    
+                            active['end'] = float(left_end)
+                            final_signs.append(active)
+                            current_signs.remove(active)
+                            need_restore_position = True
+                            
+                    if need_restore_position:
+                        # Restore the sequential frame reading back to where we paused it
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count + 1)
+                        
+                frame_count += 1
+                pbar.update(1)
             
-    # Sort them vertically based on their bounding box Y-coordinates
-    for comb in combined_signs:
-        comb['lines'].sort(key=lambda x: (x['bbox'][0][1] + x['bbox'][2][1]) / 2)
-        comb['ja_text'] = "\n".join([x['ja_text'] for x in comb['lines']])
-    
+        cap.release()
+        
+        # Sweep up any signs that were still on screen when the video ended
+        for active in current_signs:
+            active['end'] = float(active['last_seen'])
+            final_signs.append(active)
+
+        # --- COMBINE AND SORT OVERLAPPING SIGNS ---
+        print("Combining overlapping on-screen text...")
+        combined_signs = []
+        
+        for sign in sorted(final_signs, key=lambda x: x['start']):
+            overlap_found = False
+            for comb in combined_signs:
+                if comb['pos'] == sign['pos']:
+                    # If they overlap in time
+                    start_max = max(comb['start'], sign['start'])
+                    end_min = min(comb['end'], sign['end'])
+                    if end_min > start_max:
+                        comb['start'] = min(comb['start'], sign['start'])
+                        comb['end'] = max(comb['end'], sign['end'])
+                        comb['lines'].append(sign)
+                        overlap_found = True
+                        break
+                        
+            if not overlap_found:
+                combined_signs.append({
+                    'start': sign['start'],
+                    'end': sign['end'],
+                    'pos': sign['pos'],
+                    'lines': [sign]
+                })
+                
+        # Sort them vertically based on their bounding box Y-coordinates
+        for comb in combined_signs:
+            comb['lines'].sort(key=lambda x: (x['bbox'][0][1] + x['bbox'][2][1]) / 2)
+            comb['ja_text'] = "\n".join([x['ja_text'] for x in comb['lines']])
+
+        print(f"Caching detected signs to {ocr_signs_cache_file}...")
+        with open(ocr_signs_cache_file, "w", encoding="utf-8") as f:
+            json.dump(combined_signs, f, ensure_ascii=False, indent=2)
+
+    # --- GEMINI TRANSLATION BATCHING ---
     ocr_srt_blocks = []
     if combined_signs:
         print(f"\nFound {len(combined_signs)} grouped on-screen signs. Batch translating via Gemini...")
