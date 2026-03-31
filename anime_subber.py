@@ -8,6 +8,7 @@ import re
 import cv2
 import numpy as np
 import shutil
+import concurrent.futures
 from pydub import AudioSegment
 from thefuzz import fuzz
 
@@ -19,12 +20,51 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # --- CONFIGURATION ---
-client = genai.Client()
-SUPPORTED_EXTS = ('.mp4', '.mkv', '.avi', '.mov', '.webm')
+# NOTE: You must set the GEMINI_API_KEY environment variable before running this script.
+# Windows (CMD): set GEMINI_API_KEY="your_api_key_here"
+# Windows (PowerShell): $env:GEMINI_API_KEY="your_api_key_here"
+# Mac/Linux: export GEMINI_API_KEY="your_api_key_here"
 
-CHUNK_LENGTH_MS = 2 * 60 * 1000  # 2 minutes
+client = genai.Client()
+SUPPORTED_EXTS = ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.mp3', '.wav')
+
+CHUNK_LENGTH_MS = 4 * 60 * 1000  # 4 minutes
 OVERLAP_MS = 30 * 1000           # 30 seconds overlap
 STEP_MS = CHUNK_LENGTH_MS - OVERLAP_MS
+ORPHAN_GAP_THRESH_SEC = 20.0     # Threshold in seconds to trigger a re-translation of missing dialogue
+
+class GeminiManager:
+    """Handles API calls, quota fallbacks, and the kill-switch if limits are exceeded."""
+    def __init__(self, use_lite=False):
+        self.api_exhausted = False
+        self.models = ["gemini-flash-latest", "gemini-flash-lite-latest"]
+        if use_lite:
+            self.models = ["gemini-flash-lite-latest"]
+            
+    def generate(self, contents, config):
+        if self.api_exhausted:
+            return None
+        
+        for model_name in self.models:
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=config
+                )
+                return response
+            except Exception as e:
+                err_str = str(e).lower()
+                if "429" in err_str or "quota" in err_str or "exhausted" in err_str:
+                    print(f"  [Gemini] Model {model_name} exhausted or rate-limited.")
+                    continue
+                else:
+                    print(f"  [Gemini] Error with {model_name}: {e}")
+                    continue
+        
+        print("\n[!] All available Gemini models exhausted their API quota. Suspending API calls.")
+        self.api_exhausted = True
+        return None
 
 def format_srt_time(seconds):
     delta = datetime.timedelta(seconds=seconds)
@@ -44,12 +84,10 @@ def format_srt_time(seconds):
     return f"{time_str},{ms_str}"
 
 def srt_time_to_seconds(time_str):
-    """Converts SRT timestamp (HH:MM:SS,mmm) to seconds."""
     h, m, s = time_str.replace(',', '.').split(':')
     return int(h) * 3600 + int(m) * 60 + float(s)
 
 def parse_srt(filepath):
-    """Parses an existing SRT file into a list of subtitle dictionaries."""
     with open(filepath, 'r', encoding='utf-8') as f:
         content = f.read().strip().split('\n\n')
     subs = []
@@ -87,30 +125,48 @@ def parse_llm_json(text):
         try:
             return json.loads(text_cleaned)
         except Exception as final_e:
-            print(f"Failed to parse JSON completely. Error: {final_e}")
             return []
 
 def get_numpad_position(bbox, width, height):
-    """Maps an EasyOCR bounding box to a numpad position (1-9) for SRT {\\anX} tags."""
     tl, tr, br, bl = bbox
     center_x = (tl[0] + br[0]) / 2
     center_y = (tl[1] + br[1]) / 2
     
     col = 1 if center_x < width / 3 else (3 if center_x > 2 * width / 3 else 2)
     if center_y < height / 3:
-        row = 3  # Top of screen
+        row = 3 
     elif center_y > 2 * height / 3:
-        row = 1  # Bottom of screen
+        row = 1 
     else:
-        row = 2  # Middle of screen
+        row = 2 
         
-    # Numpad mapping grid
     numpad = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
     return numpad[row-1][col-1]
 
-def align_audio_subs(gemini_data, whisper_segments, last_global_end_time):
-    """Matches Gemini translations to the absolute Whisper timestamps."""
+def refine_early_timestamps(start_time, end_time, full_audio, prev_end_time):
+    """Trims leading noise/silence if a subtitle starts too early or immediately after the previous one."""
+    if start_time == 0 or start_time == prev_end_time:
+        try:
+            check_duration = min(1.0, end_time - start_time)
+            if check_duration <= 0.1: return start_time
+            
+            segment = full_audio[int(start_time * 1000):int((start_time + check_duration) * 1000)]
+            peak = segment.max_dBFS
+            if peak == float('-inf'): return start_time
+            
+            # Scan in 50ms windows to find when the audio gets within 15dB of the peak
+            window_ms = 50
+            for i in range(0, len(segment), window_ms):
+                window = segment[i:i+window_ms]
+                if window.max_dBFS > peak - 15:
+                    return start_time + (i / 1000.0)
+        except Exception:
+            pass 
+    return start_time
+
+def align_audio_subs(gemini_data, whisper_segments, last_global_end_time, strict_timing=False, full_audio=None):
     srt_blocks = []
+    used_whisper_indices = set()
     last_match_idx = 0
     
     for g_line in gemini_data:
@@ -127,7 +183,9 @@ def align_audio_subs(gemini_data, whisper_segments, last_global_end_time):
         best_start_idx = -1
         best_end_idx = -1
         
-        max_search_ahead = min(last_match_idx + 20, len(whisper_segments))
+        # Increased to 100. Whisper often generates dozens of tiny fragmented 
+        # noise/music segments. We need a large enough search window to jump over them.
+        max_search_ahead = min(last_match_idx + 100, len(whisper_segments))
         
         for i in range(last_match_idx, max_search_ahead):
             combined_text = ""
@@ -150,11 +208,12 @@ def align_audio_subs(gemini_data, whisper_segments, last_global_end_time):
             matched_end_seg = whisper_segments[best_end_idx]
             last_match_idx = best_end_idx + 1 
             
-            # Since Whisper was run on the full file, these timestamps are absolute. No offset needed.
             start_time = matched_start_seg['start']
             end_time = matched_end_seg['end']
             
-            # Prevent overlap duplicates from the sliding chunk window
+            if strict_timing and full_audio is not None:
+                start_time = refine_early_timestamps(start_time, end_time, full_audio, last_global_end_time)
+            
             if start_time < last_global_end_time - 0.5:
                 start_time = max(start_time, last_global_end_time + 0.001)
                 if start_time >= end_time:
@@ -164,16 +223,196 @@ def align_audio_subs(gemini_data, whisper_segments, last_global_end_time):
                 'start': start_time,
                 'end': end_time,
                 'text': en_text,
-                'pos': None # Audio doesn't get numpad positioning
+                'pos': None 
             })
-            print(f"[{format_srt_time(start_time).split(',')[0]}] {en_text}")
             
+            # Track which global indices were used
+            used_whisper_indices.update(whisper_segments[idx]['global_idx'] for idx in range(best_start_idx, best_end_idx + 1))
             last_global_end_time = end_time 
             
-    return srt_blocks, last_global_end_time
+    return srt_blocks, last_global_end_time, used_whisper_indices
+
+def run_whisper_pass(audio, video_file):
+    whisper_cache_file = os.path.splitext(video_file)[0] + ".whisper.json"
+    
+    if os.path.exists(whisper_cache_file):
+        print(f"[Whisper] Loading cached transcription from {whisper_cache_file}...")
+        with open(whisper_cache_file, "r", encoding="utf-8") as f:
+            segments = json.load(f)
+    else:
+        print("[Whisper] Loading local model (large) for perfect timestamping...")
+        whisper_model = whisper.load_model("large", device="cuda")
+        
+        temp_full_audio = "temp_full_audio.wav"
+        audio.export(temp_full_audio, format="wav")
+        
+        print("[Whisper] Transcribing full audio track...")
+        whisper_result = whisper_model.transcribe(temp_full_audio, language="ja")
+        segments = whisper_result['segments']
+        os.remove(temp_full_audio)
+        
+        print(f"[Whisper] Caching transcription to {whisper_cache_file}...")
+        with open(whisper_cache_file, "w", encoding="utf-8") as f:
+            json.dump(segments, f, ensure_ascii=False, indent=2)
+
+    # Assign a global ID so we can track orphans later
+    for i, seg in enumerate(segments):
+        seg['global_idx'] = i
+        
+    return segments
+
+def run_gemini_pass(audio, video_file, gemini_manager, config):
+    gemini_chunks_data = []
+    
+    for start_ms in range(0, len(audio), STEP_MS):
+        end_ms = min(start_ms + CHUNK_LENGTH_MS, len(audio))
+        chunk = audio[start_ms:end_ms]
+        time_offset_seconds = start_ms / 1000.0
+        
+        chunk_num = (start_ms // STEP_MS) + 1
+        total_chunks = (len(audio) // STEP_MS) + 1
+        
+        gemini_cache_file = os.path.splitext(video_file)[0] + f".gemini_chunk_{chunk_num}.json"
+        gemini_data = None
+        
+        if os.path.exists(gemini_cache_file):
+            print(f"[Gemini] Loading cached translation for chunk {chunk_num}/{total_chunks}...")
+            try:
+                with open(gemini_cache_file, "r", encoding="utf-8") as f:
+                    gemini_data = json.load(f)
+            except Exception as e:
+                print(f"[Gemini] Error loading cache for chunk {chunk_num}: {e}. Re-running...")
+        
+        if not gemini_data and not gemini_manager.api_exhausted:
+            print(f"[Gemini] Processing Audio Chunk {chunk_num}/{total_chunks}...")
+            temp_audio_path = f"temp_chunk_{chunk_num}.wav"
+            chunk.export(temp_audio_path, format="wav")
+            
+            try:
+                wav_data = open(temp_audio_path, "rb").read()
+                response = gemini_manager.generate(
+                    contents=[
+                        types.Part.from_bytes(data=wav_data, mime_type="audio/wav"),
+                        "Transcribe and translate this audio into the requested JSON format."
+                    ],
+                    config=config
+                )
+
+                if response:
+                    raw_text = response.text.strip()
+                    try:
+                        gemini_data = json.loads(raw_text)
+                    except json.JSONDecodeError as e:
+                        if "Extra data" in e.msg:
+                            clean_text = raw_text[:e.pos].strip()
+                            gemini_data = json.loads(clean_text)
+                        else:
+                            gemini_data = parse_llm_json(raw_text)
+                            
+                    if gemini_data:
+                        print(f"[Gemini] Caching translation for chunk {chunk_num}...")
+                        with open(gemini_cache_file, "w", encoding="utf-8") as f:
+                            json.dump(gemini_data, f, ensure_ascii=False, indent=2)
+                
+            except Exception as e:
+                print(f"[Gemini] Error processing audio chunk {chunk_num}: {e}")
+                
+            finally:
+                if os.path.exists(temp_audio_path):
+                    os.remove(temp_audio_path)
+        
+        gemini_chunks_data.append((gemini_data, time_offset_seconds, end_ms / 1000.0))
+        if end_ms >= len(audio):
+            break
+            
+    return gemini_chunks_data
+
+def recheck_missing_dialogue(audio, whisper_segments, used_indices, gemini_manager, config, strict_timing, video_file):
+    print("\n--- Scanning for Missing Dialogue ---")
+    new_subtitles = []
+    orphan_blocks = []
+    current_block = []
+    
+    for seg in whisper_segments:
+        if seg['global_idx'] not in used_indices:
+            text = normalize_text(seg['text'])
+            if len(text) > 1:  # Contains actual content, not just music symbols
+                current_block.append(seg)
+        else:
+            if current_block:
+                orphan_blocks.append(current_block)
+                current_block = []
+                
+    if current_block:
+        orphan_blocks.append(current_block)
+        
+    chunk_sub_counters = {}  # Tracks the Y counter for each X chunk
+        
+    for block in orphan_blocks:
+        start_seg = block[0]
+        end_seg = block[-1]
+        duration = end_seg['end'] - start_seg['start']
+        
+        # If the missing gap is significant (> ORPHAN_GAP_THRESH_SEC)
+        if duration > ORPHAN_GAP_THRESH_SEC:
+            start_ms_calc = int(start_seg['start'] * 1000)
+            chunk_x = (start_ms_calc // STEP_MS) + 1
+            chunk_y = chunk_sub_counters.get(chunk_x, 1)
+            chunk_sub_counters[chunk_x] = chunk_y + 1
+            
+            gemini_cache_file = os.path.splitext(video_file)[0] + f".gemini_chunk_{chunk_x}.{chunk_y}.json"
+            gemini_data = None
+            
+            time_start_str = format_srt_time(start_seg['start']).split(',')[0]
+            print(f"Targeting missing dialogue at {time_start_str} (Chunk {chunk_x}.{chunk_y})...")
+            
+            if os.path.exists(gemini_cache_file):
+                print(f"  [Gemini] Loading cached missing dialogue translation from {gemini_cache_file}...")
+                try:
+                    with open(gemini_cache_file, "r", encoding="utf-8") as f:
+                        gemini_data = json.load(f)
+                except Exception as e:
+                    print(f"  [Gemini] Error loading cache for chunk {chunk_x}.{chunk_y}: {e}. Re-running...")
+            
+            if not gemini_data and not gemini_manager.api_exhausted:
+                start_ms = max(0, int(start_seg['start'] * 1000) - 500)
+                end_ms = min(len(audio), int(end_seg['end'] * 1000) + 500)
+                
+                chunk = audio[start_ms:end_ms]
+                wav_io = io.BytesIO()
+                chunk.export(wav_io, format="wav")
+                
+                response = gemini_manager.generate(
+                    contents=[
+                        types.Part.from_bytes(data=wav_io.getvalue(), mime_type="audio/wav"),
+                        "Transcribe and translate this missed audio segment into the requested JSON format."
+                    ],
+                    config=config
+                )
+                
+                if response:
+                    raw_text = response.text.strip()
+                    try:
+                        gemini_data = json.loads(raw_text)
+                    except json.JSONDecodeError as e:
+                        if "Extra data" in e.msg:
+                            clean_text = raw_text[:e.pos].strip()
+                            gemini_data = json.loads(clean_text)
+                        else:
+                            gemini_data = parse_llm_json(raw_text)
+                            
+                    if gemini_data:
+                        print(f"  [Gemini] Caching missing dialogue translation to {gemini_cache_file}...")
+                        with open(gemini_cache_file, "w", encoding="utf-8") as f:
+                            json.dump(gemini_data, f, ensure_ascii=False, indent=2)
+            
+            if gemini_data:
+                subs, _, _ = align_audio_subs(gemini_data, block, -1.0, strict_timing, audio)
+                new_subtitles.extend(subs)
+                    
+    return new_subtitles
 
 def process_video_signs(video_file):
-    """Scans the video for Japanese text, groups consecutive sightings, and translates via Gemini."""
     import easyocr
     print("\n--- Starting Vision Pass for On-Screen Text ---")
     print("Loading EasyOCR (This requires significant VRAM)...")
@@ -184,7 +423,7 @@ def process_video_signs(video_file):
     width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
     height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
     
-    frame_interval = int(fps) # Scan 1 frame per second
+    frame_interval = int(fps) 
     current_signs = []
     final_signs = []
     
@@ -202,9 +441,8 @@ def process_video_signs(video_file):
             for bbox, text, conf in detected_texts:
                 if conf < 0.6: continue
                 norm_t = normalize_text(text)
-                if len(norm_t) < 2: continue # Ignore isolated single characters
+                if len(norm_t) < 2: continue 
                 
-                # Check if we are already tracking this sign
                 found = False
                 for active in current_signs:
                     if fuzz.ratio(norm_t, active['norm_text']) > 80:
@@ -221,7 +459,6 @@ def process_video_signs(video_file):
                         'pos': get_numpad_position(bbox, width, height)
                     })
             
-            # Move expired signs to the final list
             for active in current_signs[:]:
                 if current_time_sec > active['end'] + 1.5:
                     final_signs.append(active)
@@ -235,8 +472,6 @@ def process_video_signs(video_file):
     ocr_srt_blocks = []
     if final_signs:
         print(f"\nFound {len(final_signs)} on-screen signs. Batch translating via Gemini...")
-        
-        # Batch to prevent token bloat
         batch_size = 50
         for i in range(0, len(final_signs), batch_size):
             batch = final_signs[i:i+batch_size]
@@ -256,13 +491,12 @@ def process_video_signs(video_file):
                 )
                 
                 translations = parse_llm_json(response.text)
-                
                 for sign, en_text in zip(batch, translations):
                     if en_text:
                         ocr_srt_blocks.append({
                             'start': sign['start'],
                             'end': sign['end'],
-                            'text': f"[{en_text}]", # Brackets clearly denote on-screen text
+                            'text': f"[{en_text}]", 
                             'pos': sign['pos']
                         })
             except Exception as e:
@@ -270,11 +504,9 @@ def process_video_signs(video_file):
                 
     return ocr_srt_blocks
 
-def process_anime_video(video_file, output_srt, run_ocr=False, ocr_only=False):
+def process_anime_video(video_file, output_srt, run_ocr=False, ocr_only=False, strict_timing=False, use_lite=False):
     print(f"\nLoading {video_file}...")
-
     all_subtitles = []
-    last_global_end_time = -1.0 
 
     if ocr_only:
         print("\n--- OCR Only Mode ---")
@@ -291,30 +523,8 @@ def process_anime_video(video_file, output_srt, run_ocr=False, ocr_only=False):
             print(f"Failed to extract audio: {e}")
             return
 
-        # 1. UPFRONT WHISPER PASS ON FULL AUDIO
-        print("\n--- Starting Audio Pass ---")
-        whisper_cache_file = os.path.splitext(video_file)[0] + ".whisper.json"
+        gemini_manager = GeminiManager(use_lite=use_lite)
         
-        if os.path.exists(whisper_cache_file):
-            print(f"Loading cached Whisper transcription from {whisper_cache_file}...")
-            with open(whisper_cache_file, "r", encoding="utf-8") as f:
-                global_whisper_segments = json.load(f)
-        else:
-            print("Loading local Whisper model (large) for perfect timestamping...")
-            whisper_model = whisper.load_model("large", device="cuda")
-            
-            temp_full_audio = "temp_full_audio.wav"
-            audio.export(temp_full_audio, format="wav")
-            
-            print("Transcribing full audio track (This takes a moment but saves time later)...")
-            whisper_result = whisper_model.transcribe(temp_full_audio, language="ja")
-            global_whisper_segments = whisper_result['segments']
-            os.remove(temp_full_audio)
-            
-            print(f"Caching Whisper transcription to {whisper_cache_file}...")
-            with open(whisper_cache_file, "w", encoding="utf-8") as f:
-                json.dump(global_whisper_segments, f, ensure_ascii=False, indent=2)
-
         system_instruction = (
             "You are an expert anime translator. You will receive an audio clip. "
             "Transcribe the spoken Japanese, and translate it into natural English. "
@@ -330,89 +540,43 @@ def process_anime_video(video_file, output_srt, run_ocr=False, ocr_only=False):
             response_mime_type="application/json"
         )
 
-        print("Beginning chunked Gemini translation...")
+        print("\n--- Starting Parallel Audio Processing ---")
+        # Run Whisper and Gemini tasks in parallel to save time
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            future_whisper = executor.submit(run_whisper_pass, audio, video_file)
+            future_gemini = executor.submit(run_gemini_pass, audio, video_file, gemini_manager, generation_config)
+            
+            global_whisper_segments = future_whisper.result()
+            gemini_chunks_data = future_gemini.result()
+
+        print("\n--- Starting Alignment Pass ---")
+        last_global_end_time = -1.0 
+        used_whisper_indices = set()
         
-        for start_ms in range(0, len(audio), STEP_MS):
-            end_ms = min(start_ms + CHUNK_LENGTH_MS, len(audio))
-            chunk = audio[start_ms:end_ms]
+        # Sequentially align the translated chunks against the Whisper blueprint
+        for gemini_data, start_sec, end_sec in gemini_chunks_data:
+            if not gemini_data: continue
             
-            time_offset_seconds = start_ms / 1000.0
+            chunk_w_segs = [seg for seg in global_whisper_segments if 
+                            seg['start'] >= (start_sec - 15) and 
+                            seg['end'] <= (end_sec + 15)]
             
-            chunk_num = (start_ms // STEP_MS) + 1
-            total_chunks = (len(audio) // STEP_MS) + 1
+            chunk_srt_lines, last_global_end_time, chunk_used_idx = align_audio_subs(
+                gemini_data, chunk_w_segs, last_global_end_time, strict_timing, audio
+            )
+            all_subtitles.extend(chunk_srt_lines)
+            used_whisper_indices.update(chunk_used_idx)
             
-            print(f"\nProcessing Audio Chunk {chunk_num}/{total_chunks}...")
-            
-            gemini_data = None
-            gemini_cache_file = os.path.splitext(video_file)[0] + f".gemini_chunk_{chunk_num}.json"
-            
-            if os.path.exists(gemini_cache_file):
-                print(f"Loading cached Gemini translation for chunk {chunk_num}...")
-                try:
-                    with open(gemini_cache_file, "r", encoding="utf-8") as f:
-                        gemini_data = json.load(f)
-                except Exception as e:
-                    print(f"Error loading cache for chunk {chunk_num}: {e}. Re-running translation...")
-                    gemini_data = None
-            
-            if not gemini_data:
-                temp_audio_path = f"temp_chunk_{chunk_num}.wav"
-                chunk.export(temp_audio_path, format="wav")
-                
-                try:
-                    wav_data = open(temp_audio_path, "rb").read()
-                    response = client.models.generate_content(
-                        model="gemini-flash-latest",
-                        contents=[
-                            types.Part.from_bytes(data=wav_data, mime_type="audio/wav"),
-                            "Transcribe and translate this audio into the requested JSON format."
-                        ],
-                        config=generation_config
-                    )
+        # Re-check orphaned Whisper segments
+        missing_subs = recheck_missing_dialogue(audio, global_whisper_segments, used_whisper_indices, gemini_manager, generation_config, strict_timing, video_file)
+        if missing_subs:
+            all_subtitles.extend(missing_subs)
 
-                    raw_text = response.text.strip()
-                    try:
-                        gemini_data = json.loads(raw_text)
-                    except json.JSONDecodeError as e:
-                        if "Extra data" in e.msg:
-                            clean_text = raw_text[:e.pos].strip()
-                            gemini_data = json.loads(clean_text)
-                        else:
-                            raise
-                            
-                    print(f"Caching Gemini translation for chunk {chunk_num}...")
-                    with open(gemini_cache_file, "w", encoding="utf-8") as f:
-                        json.dump(gemini_data, f, ensure_ascii=False, indent=2)
-                    
-                except Exception as e:
-                    print(f"Error processing audio chunk {chunk_num}: {e}")
-                    
-                finally:
-                    if os.path.exists(temp_audio_path):
-                        os.remove(temp_audio_path)
-            
-            if gemini_data:
-                # Filter the global whisper segments to only those inside this chunk's timeframe (+15s buffer)
-                chunk_w_segs = [seg for seg in global_whisper_segments if 
-                                seg['start'] >= (time_offset_seconds - 15) and 
-                                seg['end'] <= (end_ms / 1000.0 + 15)]
-                
-                chunk_srt_lines, last_global_end_time = align_audio_subs(
-                    gemini_data, chunk_w_segs, last_global_end_time
-                )
-                all_subtitles.extend(chunk_srt_lines)
-                    
-            if end_ms >= len(audio):
-                break
-
-    # 2. OPTIONAL VISION PASS
     if run_ocr or ocr_only:
         ocr_subtitles = process_video_signs(video_file)
         all_subtitles.extend(ocr_subtitles)
 
-    # 3. SORT AND FORMAT FINAL SRT
     if all_subtitles:
-        # Sort chronologically so audio and OCR text are perfectly interwoven
         all_subtitles.sort(key=lambda x: x['start'])
         
         final_srt_lines = []
@@ -432,12 +596,12 @@ def process_anime_video(video_file, output_srt, run_ocr=False, ocr_only=False):
     else:
         print("\nFailed to generate any subtitles.")
 
-def process_target_path(target_path, run_ocr=False, ocr_only=False):
+def process_target_path(target_path, run_ocr=False, ocr_only=False, strict_timing=False, use_lite=False, force_update=False):
     if os.path.isfile(target_path):
         if target_path.lower().endswith(SUPPORTED_EXTS):
             output_srt = os.path.splitext(target_path)[0] + ".srt"
-            if not os.path.exists(output_srt) or ocr_only:
-                process_anime_video(target_path, output_srt, run_ocr, ocr_only)
+            if not os.path.exists(output_srt) or ocr_only or force_update:
+                process_anime_video(target_path, output_srt, run_ocr, ocr_only, strict_timing, use_lite)
             else:
                 print(f"Skipping: {target_path} (SRT already exists)")
     elif os.path.isdir(target_path):
@@ -446,8 +610,8 @@ def process_target_path(target_path, run_ocr=False, ocr_only=False):
                 if file.lower().endswith(SUPPORTED_EXTS):
                     video_path = os.path.join(root, file)
                     output_srt = os.path.splitext(video_path)[0] + ".srt"
-                    if not os.path.exists(output_srt) or ocr_only:
-                        process_anime_video(video_path, output_srt, run_ocr, ocr_only)
+                    if not os.path.exists(output_srt) or ocr_only or force_update:
+                        process_anime_video(video_path, output_srt, run_ocr, ocr_only, strict_timing, use_lite)
                     else:
                         print(f"Skipping: {file} (SRT already exists)")
 
@@ -456,5 +620,8 @@ if __name__ == "__main__":
     parser.add_argument("path", help="Path to video file or directory.")
     parser.add_argument("--ocr", action="store_true", help="Enable vision pass to detect and translate on-screen Japanese text.")
     parser.add_argument("--ocr_only", action="store_true", help="Only run the vision pass. Appends to existing SRT and creates backup.")
+    parser.add_argument("--strict_timing", action="store_true", help="Analyze audio volume to trim silent intros from early subtitles.")
+    parser.add_argument("--lite", action="store_true", help="Force the use of the cheaper gemini-flash-lite-latest model.")
+    parser.add_argument("--force_update", action="store_true", help="Regenerate the SRT file even if it already exists, using cached API outputs where available.")
     args = parser.parse_args()
-    process_target_path(args.path, args.ocr, args.ocr_only)
+    process_target_path(args.path, args.ocr, args.ocr_only, args.strict_timing, args.lite, args.force_update)
