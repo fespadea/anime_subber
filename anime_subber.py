@@ -451,128 +451,130 @@ def process_video_signs(video_file, gemini_manager):
                 
             if frame_count % frame_interval == 0:
                 current_time_sec = frame_count / fps
-            
-            seen_this_frame = []
-            need_restore_position = False
-            
-            for bbox, text, conf in detected_texts:
-                if conf < 0.6: continue
-                norm_t = normalize_text(text)
-                if len(norm_t) < 2: continue 
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                detected_texts = reader.readtext(gray, detail=1)
                 
-                found = False
-                for active in current_signs:
-                    if fuzz.ratio(norm_t, active['norm_text']) > 80:
-                        active['last_seen'] = current_time_sec
-                        active['bbox'] = bbox
-                        seen_this_frame.append(active)
-                        found = True
-                        break
+                seen_this_frame = []
+                need_restore_position = False
                 
-                if not found:
-                    # Binary search backwards to find EXACT start time
-                    left_start = max(0.0, current_time_sec - scan_interval_sec - 0.1)
-                    right_start = current_time_sec
+                for bbox, text, conf in detected_texts:
+                    if conf < 0.6: continue
+                    norm_t = normalize_text(text)
+                    if len(norm_t) < 2: continue 
                     
-                    for _ in range(4): # 4 steps = ~0.06s precision
-                        mid = (left_start + right_start) / 2.0
-                        cap.set(cv2.CAP_PROP_POS_MSEC, mid * 1000)
-                        ret_mid, f_mid = cap.read()
-                        if not ret_mid:
-                            right_start = mid
-                            continue
-                            
-                        g_mid = cv2.cvtColor(f_mid, cv2.COLOR_BGR2GRAY)
-                        tl, tr, br, bl = bbox
-                        x_min = max(0, int(min(tl[0], bl[0])) - 20)
-                        x_max = min(int(width), int(max(tr[0], br[0])) + 20)
-                        y_min = max(0, int(min(tl[1], tr[1])) - 20)
-                        y_max = min(int(height), int(max(bl[1], br[1])) + 20)
+                    found = False
+                    for active in current_signs:
+                        if fuzz.ratio(norm_t, active['norm_text']) > 80:
+                            active['last_seen'] = current_time_sec
+                            active['bbox'] = bbox
+                            seen_this_frame.append(active)
+                            found = True
+                            break
+                    
+                    if not found:
+                        # Binary search backwards to find EXACT start time
+                        left_start = max(0.0, current_time_sec - scan_interval_sec - 0.1)
+                        right_start = current_time_sec
                         
-                        if x_max <= x_min or y_max <= y_min:
-                            right_start = mid
-                            continue
-                            
-                        crop = g_mid[y_min:y_max, x_min:x_max]
-                        if crop.size == 0:
-                            right_start = mid
-                            continue
-                            
-                        det = reader.readtext(crop, detail=0)
-                        found_in_mid = False
-                        for dt in det:
-                            if fuzz.ratio(normalize_text(dt), norm_t) > 80:
-                                found_in_mid = True
-                                break
+                        for _ in range(4): # 4 steps = ~0.06s precision
+                            mid = (left_start + right_start) / 2.0
+                            cap.set(cv2.CAP_PROP_POS_MSEC, mid * 1000)
+                            ret_mid, f_mid = cap.read()
+                            if not ret_mid:
+                                right_start = mid
+                                continue
                                 
-                        if found_in_mid:
-                            right_start = mid 
-                        else:
-                            left_start = mid 
+                            g_mid = cv2.cvtColor(f_mid, cv2.COLOR_BGR2GRAY)
+                            tl, tr, br, bl = bbox
+                            x_min = max(0, int(min(tl[0], bl[0])) - 20)
+                            x_max = min(int(width), int(max(tr[0], br[0])) + 20)
+                            y_min = max(0, int(min(tl[1], tr[1])) - 20)
+                            y_max = min(int(height), int(max(bl[1], br[1])) + 20)
                             
-                    new_sign = {
-                        'start': right_start,
-                        'last_seen': current_time_sec,
-                        'ja_text': text,
-                        'norm_text': norm_t,
-                        'bbox': bbox,
-                        'pos': get_numpad_position(bbox, width, height)
-                    }
-                    current_signs.append(new_sign)
-                    seen_this_frame.append(new_sign)
-                    need_restore_position = True
-            
-            for active in current_signs[:]:
-                if active not in seen_this_frame:
-                    # Binary search forwards to find EXACT end time
-                    left_end = active['last_seen']
-                    right_end = current_time_sec
-                    
-                    for _ in range(4):
-                        mid = (left_end + right_end) / 2.0
-                        cap.set(cv2.CAP_PROP_POS_MSEC, mid * 1000)
-                        ret_mid, f_mid = cap.read()
-                        if not ret_mid:
-                            right_end = mid
-                            continue
-                            
-                        g_mid = cv2.cvtColor(f_mid, cv2.COLOR_BGR2GRAY)
-                        tl, tr, br, bl = active['bbox']
-                        x_min = max(0, int(min(tl[0], bl[0])) - 20)
-                        x_max = min(int(width), int(max(tr[0], br[0])) + 20)
-                        y_min = max(0, int(min(tl[1], tr[1])) - 20)
-                        y_max = min(int(height), int(max(bl[1], br[1])) + 20)
-                        
-                        if x_max <= x_min or y_max <= y_min:
-                            right_end = mid
-                            continue
-                            
-                        crop = g_mid[y_min:y_max, x_min:x_max]
-                        if crop.size == 0:
-                            right_end = mid
-                            continue
-                            
-                        det = reader.readtext(crop, detail=0)
-                        found_in_mid = False
-                        for dt in det:
-                            if fuzz.ratio(normalize_text(dt), active['norm_text']) > 80:
-                                found_in_mid = True
-                                break
+                            if x_max <= x_min or y_max <= y_min:
+                                right_start = mid
+                                continue
                                 
-                        if found_in_mid:
-                            left_end = mid
-                        else:
-                            right_end = mid
-                            
-                    active['end'] = left_end
-                    final_signs.append(active)
-                    current_signs.remove(active)
-                    need_restore_position = True
-                    
-            if need_restore_position:
-                # Restore the sequential frame reading back to where we paused it
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count + 1)
+                            crop = g_mid[y_min:y_max, x_min:x_max]
+                            if crop.size == 0:
+                                right_start = mid
+                                continue
+                                
+                            det = reader.readtext(crop, detail=0)
+                            found_in_mid = False
+                            for dt in det:
+                                if fuzz.ratio(normalize_text(dt), norm_t) > 80:
+                                    found_in_mid = True
+                                    break
+                                    
+                            if found_in_mid:
+                                right_start = mid 
+                            else:
+                                left_start = mid 
+                                
+                        new_sign = {
+                            'start': right_start,
+                            'last_seen': current_time_sec,
+                            'ja_text': text,
+                            'norm_text': norm_t,
+                            'bbox': bbox,
+                            'pos': get_numpad_position(bbox, width, height)
+                        }
+                        current_signs.append(new_sign)
+                        seen_this_frame.append(new_sign)
+                        need_restore_position = True
                 
+                for active in current_signs[:]:
+                    if active not in seen_this_frame:
+                        # Binary search forwards to find EXACT end time
+                        left_end = active['last_seen']
+                        right_end = current_time_sec
+                        
+                        for _ in range(4):
+                            mid = (left_end + right_end) / 2.0
+                            cap.set(cv2.CAP_PROP_POS_MSEC, mid * 1000)
+                            ret_mid, f_mid = cap.read()
+                            if not ret_mid:
+                                right_end = mid
+                                continue
+                                
+                            g_mid = cv2.cvtColor(f_mid, cv2.COLOR_BGR2GRAY)
+                            tl, tr, br, bl = active['bbox']
+                            x_min = max(0, int(min(tl[0], bl[0])) - 20)
+                            x_max = min(int(width), int(max(tr[0], br[0])) + 20)
+                            y_min = max(0, int(min(tl[1], tr[1])) - 20)
+                            y_max = min(int(height), int(max(bl[1], br[1])) + 20)
+                            
+                            if x_max <= x_min or y_max <= y_min:
+                                right_end = mid
+                                continue
+                                
+                            crop = g_mid[y_min:y_max, x_min:x_max]
+                            if crop.size == 0:
+                                right_end = mid
+                                continue
+                                
+                            det = reader.readtext(crop, detail=0)
+                            found_in_mid = False
+                            for dt in det:
+                                if fuzz.ratio(normalize_text(dt), active['norm_text']) > 80:
+                                    found_in_mid = True
+                                    break
+                                    
+                            if found_in_mid:
+                                left_end = mid
+                            else:
+                                right_end = mid
+                                
+                        active['end'] = left_end
+                        final_signs.append(active)
+                        current_signs.remove(active)
+                        need_restore_position = True
+                        
+                if need_restore_position:
+                    # Restore the sequential frame reading back to where we paused it
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count + 1)
+                    
             frame_count += 1
             pbar.update(1)
         
