@@ -80,7 +80,7 @@ class GeminiManager:
         return None
 
 def format_srt_time(seconds):
-    delta = datetime.timedelta(seconds=seconds)
+    delta = datetime.timedelta(seconds=max(0.0, seconds))
     time_str = str(delta)
     if '.' in time_str:
         time_str, ms_str = time_str.split('.')
@@ -138,6 +138,7 @@ def parse_llm_json(text):
         try:
             return json.loads(text_cleaned)
         except Exception as final_e:
+            print(f"Failed to parse JSON completely. Error: {final_e}")
             return []
 
 def get_numpad_position(bbox, width, height):
@@ -178,11 +179,13 @@ def refine_early_timestamps(start_time, end_time, full_audio, prev_end_time):
     return start_time
 
 def distribute_evenly(buffer, gap_start, gap_end, strict_timing, full_audio):
-    """Fallback to evenly distribute subtitles chronologically if all Whisper mappings fail."""
+    """Absolute last-resort fallback to distribute unmapped lines so they are NEVER dropped."""
     blocks = []
     if not buffer: return blocks, gap_start
     
-    duration = max(0.5, gap_end - gap_start)
+    gap_start = max(0.0, gap_start)
+    # Force a minimum duration of 0.5s per line so zero-length gaps don't squish them into nothing
+    duration = max(0.5 * len(buffer), gap_end - gap_start)
     step = duration / len(buffer)
     
     l_end = gap_start
@@ -199,7 +202,7 @@ def distribute_evenly(buffer, gap_start, gap_end, strict_timing, full_audio):
         })
         print(f"  [Recovered Evenly] [{format_srt_time(st).split(',')[0]} -> {format_srt_time(en).split(',')[0]}] {g_line.get('en', '')}")
         l_end = en
-    return blocks, gap_end
+    return blocks, gap_start + duration
 
 def map_1_to_1(buffer, w_segs, l_end, strict_timing, full_audio):
     """Directly maps subtitles 1-to-1 when the counts perfectly match Whisper's detected audio spikes."""
@@ -228,31 +231,31 @@ def handle_unmapped_gap(unmapped_buffer, gap_start, gap_end, whisper_segments, s
         return [], last_global_end_time, set()
         
     gap_start = max(gap_start, last_global_end_time)
+    gap_start = max(0.0, gap_start) # Prevent negative slices from crashing extraction
+    
     if gap_end <= gap_start:
         gap_end = gap_start + (1.5 * len(unmapped_buffer))
 
     start_ms = int(gap_start * 1000)
     end_ms = int(gap_end * 1000)
     
-    # Identify existing Whisper segments purely within this gap
-    gap_w_segs = []
-    for seg in whisper_segments:
-        overlap = min(gap_end, seg['end']) - max(gap_start, seg['start'])
-        if overlap > 0.05:
-            gap_w_segs.append(seg)
-
-    # Check 1-to-1 ratio against initial Whisper segments FIRST
-    if len(unmapped_buffer) == len(gap_w_segs) and len(gap_w_segs) > 0:
-        print(f"  [Recovered] 1-to-1 ratio found in gap. Direct mapping...")
-        return map_1_to_1(unmapped_buffer, gap_w_segs, last_global_end_time, strict_timing, full_audio)
-
     # If the gap is too small or missing dependencies, skip the targeted Whisper pass
     if end_ms - start_ms < 500 or whisper_model is None or video_file is None:
+        gap_w_segs = []
+        for seg in whisper_segments:
+            overlap = min(gap_end, seg['end']) - max(gap_start, seg['start'])
+            if overlap > 0.05:
+                gap_w_segs.append(seg)
+                
+        if len(unmapped_buffer) == len(gap_w_segs) and len(gap_w_segs) > 0:
+            print(f"  [Recovered] 1-to-1 ratio found in gap. Direct mapping...")
+            return map_1_to_1(unmapped_buffer, gap_w_segs, last_global_end_time, strict_timing, full_audio)
+            
         print("  [Recovered] Gap too small or dependencies missing. Distributing evenly.")
         blocks, l_end = distribute_evenly(unmapped_buffer, gap_start, gap_end, strict_timing, full_audio)
         return blocks, l_end, set()
 
-    print(f"  [Recovered] Ratio mismatch ({len(unmapped_buffer)} Gemini vs {len(gap_w_segs)} Whisper). Running targeted Whisper pass...")
+    print(f"  [Recovered] Running targeted Whisper pass on gap {format_srt_time(gap_start).split(',')[0]} -> {format_srt_time(gap_end).split(',')[0]}...")
     
     cache_file = os.path.splitext(video_file)[0] + f".whisper_gap_{start_ms}_{end_ms}.json"
     new_w_segs = None
@@ -322,7 +325,11 @@ def align_audio_subs(gemini_data, whisper_segments, last_global_end_time, chunk_
         best_start_idx = -1
         best_end_idx = -1
         
-        max_search_ahead = min(last_match_idx + 100, len(whisper_segments))
+        # Prevent the "Jump-Ahead" bug by using a dynamic search window.
+        # Long, unique sentences can safely search 100 segments ahead to skip over hallucinated music sections.
+        # Short, common words (like "何？") are clamped to a 20-segment window so they don't jump 3 minutes into the future.
+        search_limit = 100 if len(norm_ja) >= 5 else 20
+        max_search_ahead = min(last_match_idx + search_limit, len(whisper_segments))
         
         for i in range(last_match_idx, max_search_ahead):
             combined_text = ""
@@ -334,15 +341,8 @@ def align_audio_subs(gemini_data, whisper_segments, last_global_end_time, chunk_
                 base_score = fuzz.partial_ratio(norm_ja, norm_combined)
                 size_ratio = min(len(norm_ja), len(norm_combined)) / max(len(norm_ja), len(norm_combined))
                 
-                # Apply a dynamic time penalty instead of a flat segment penalty.
-                # This stops tiny phrases like "What?" from jumping 60-second music gaps and breaking the alignment,
-                # but allows long, unique sentences to safely jump across hallucinations.
-                time_gap = max(0.0, whisper_segments[i]['start'] - last_global_end_time)
-                time_penalty = 0.0
-                if time_gap > 5.0:
-                    time_penalty = ((time_gap - 5.0) * 1.5) / max(1, len(norm_ja))
-                    
-                final_score = (base_score * (size_ratio ** 0.5)) - time_penalty
+                # Removed the destructive time penalty that was tearing valid translations apart
+                final_score = base_score * (size_ratio ** 0.5)
                 
                 if final_score > best_match_score:
                     best_match_score = final_score
@@ -354,77 +354,92 @@ def align_audio_subs(gemini_data, whisper_segments, last_global_end_time, chunk_
             matched_end_seg = whisper_segments[best_end_idx]
             last_match_idx = best_end_idx + 1 
             
-            start_time = matched_start_seg['start']
-            end_time = matched_end_seg['end']
-
-            # If we accumulated unmapped lines, process them before appending this successful match
+            # --- 1. SECURE THE PRIMARY SUBTITLE TIMESTAMPS FIRST ---
+            orig_start_time = matched_start_seg['start']
+            orig_end_time = matched_end_seg['end']
+            
+            if strict_timing and full_audio is not None:
+                orig_start_time = refine_early_timestamps(orig_start_time, orig_end_time, full_audio, last_global_end_time)
+            
+            if orig_start_time < last_global_end_time - 0.5:
+                orig_start_time = max(orig_start_time, last_global_end_time + 0.001)
+            
+            # --- 2. PROCESS ANY UNMAPPED BUFFER (THE GAP BEFORE PRIMARY) ---
             if unmapped_buffer:
                 gap_start = max(last_global_end_time, whisper_segments[0]['start'] if whisper_segments else 0.0)
-                gap_end = start_time
+                gap_start = max(0.0, gap_start) # Safe clamping
+                gap_end = orig_start_time
                 
+                # Force a minimum physical gap so lines are never squished out of existence
+                if gap_end <= gap_start:
+                    gap_end = gap_start + (1.0 * len(unmapped_buffer))
+                
+                # We completely remove 'not is_orphan' so the missing dialogue pass fully utilizes handle_unmapped_gap
                 if not is_secondary_pass and whisper_model is not None and video_file is not None:
                     dist_blocks, last_global_end_time, gap_used_idx = handle_unmapped_gap(
-                        unmapped_buffer, gap_start, gap_end, whisper_segments, strict_timing, full_audio, last_global_end_time, whisper_model, video_file
+                        unmapped_buffer, gap_start, gap_end, whisper_segments, strict_timing, full_audio, gap_start, whisper_model, video_file
                     )
                     used_whisper_indices.update(gap_used_idx)
                 else:
-                    gap_w_segs = []
-                    for seg in whisper_segments:
-                        overlap = min(gap_end, seg['end']) - max(gap_start, seg['start'])
-                        if overlap > 0.05:
-                            gap_w_segs.append(seg)
+                    gap_w_segs = [seg for seg in whisper_segments if min(gap_end, seg['end']) - max(gap_start, seg['start']) > 0.05]
                     if len(unmapped_buffer) == len(gap_w_segs) and len(gap_w_segs) > 0:
-                        dist_blocks, last_global_end_time, gap_used_idx = map_1_to_1(unmapped_buffer, gap_w_segs, last_global_end_time, strict_timing, full_audio)
+                        dist_blocks, last_global_end_time, gap_used_idx = map_1_to_1(unmapped_buffer, gap_w_segs, gap_start, strict_timing, full_audio)
                         used_whisper_indices.update(gap_used_idx)
                     else:
                         dist_blocks, last_global_end_time = distribute_evenly(unmapped_buffer, gap_start, gap_end, strict_timing, full_audio)
-                srt_blocks.extend(dist_blocks)
+                
+                # STRICT CLAMPING: Recovered blocks CANNOT physically overlap the primary subtitle, 
+                # but they are guaranteed to be appended.
+                for b in dist_blocks:
+                    b['start'] = max(gap_start, min(b['start'], orig_start_time - 0.1))
+                    b['end'] = max(b['start'] + 0.05, min(b['end'], orig_start_time - 0.001))
+                    srt_blocks.append(b)
+                    
                 unmapped_buffer = []
             
-            if strict_timing and full_audio is not None:
-                start_time = refine_early_timestamps(start_time, end_time, full_audio, last_global_end_time)
-            
-            if start_time < last_global_end_time - 0.5:
-                start_time = max(start_time, last_global_end_time + 0.001)
-                if start_time >= end_time:
-                    continue 
-                    
+            # --- 3. APPEND THE SECURED PRIMARY SUBTITLE ---
+            # Fallback to force a minimum length so primary lines are never dropped due to clamping
+            if orig_end_time <= orig_start_time:
+                orig_end_time = orig_start_time + 1.0
+                
             srt_blocks.append({
-                'start': start_time,
-                'end': end_time,
+                'start': orig_start_time,
+                'end': orig_end_time,
                 'text': en_text,
                 'pos': None 
             })
             
             prefix = "  [Recovered] " if is_secondary_pass or is_orphan else ""
-            print(f"{prefix}[{format_srt_time(start_time).split(',')[0]} -> {format_srt_time(end_time).split(',')[0]}] {en_text}")
+            print(f"{prefix}[{format_srt_time(orig_start_time).split(',')[0]} -> {format_srt_time(orig_end_time).split(',')[0]}] {en_text}")
             used_whisper_indices.update(whisper_segments[idx].get('global_idx', -1) for idx in range(best_start_idx, best_end_idx + 1))
-            last_global_end_time = end_time 
+            last_global_end_time = orig_end_time 
         else:
             # Whisper hallucinated or missed this. Buffer it to be mapped into the next available gap.
             unmapped_buffer.append(g_line)
 
     # Handle any trailing unmapped lines that fell at the very end of the chunk
     if unmapped_buffer:
-        gap_start = last_global_end_time
+        gap_start = max(0.0, last_global_end_time)
         gap_end = max(chunk_end_time, gap_start + (1.5 * len(unmapped_buffer)))
+        
         if not is_secondary_pass and whisper_model is not None and video_file is not None:
             dist_blocks, last_global_end_time, gap_used_idx = handle_unmapped_gap(
-                unmapped_buffer, gap_start, gap_end, whisper_segments, strict_timing, full_audio, last_global_end_time, whisper_model, video_file
+                unmapped_buffer, gap_start, gap_end, whisper_segments, strict_timing, full_audio, gap_start, whisper_model, video_file
             )
             used_whisper_indices.update(gap_used_idx)
         else:
-            gap_w_segs = []
-            for seg in whisper_segments:
-                overlap = min(gap_end, seg['end']) - max(gap_start, seg['start'])
-                if overlap > 0.05:
-                    gap_w_segs.append(seg)
+            gap_w_segs = [seg for seg in whisper_segments if min(gap_end, seg['end']) - max(gap_start, seg['start']) > 0.05]
             if len(unmapped_buffer) == len(gap_w_segs) and len(gap_w_segs) > 0:
-                dist_blocks, last_global_end_time, gap_used_idx = map_1_to_1(unmapped_buffer, gap_w_segs, last_global_end_time, strict_timing, full_audio)
+                dist_blocks, last_global_end_time, gap_used_idx = map_1_to_1(unmapped_buffer, gap_w_segs, gap_start, strict_timing, full_audio)
                 used_whisper_indices.update(gap_used_idx)
             else:
                 dist_blocks, last_global_end_time = distribute_evenly(unmapped_buffer, gap_start, gap_end, strict_timing, full_audio)
-        srt_blocks.extend(dist_blocks)
+                
+        for b in dist_blocks:
+            b['start'] = max(gap_start, min(b['start'], gap_end - 0.1))
+            b['end'] = max(b['start'] + 0.05, min(b['end'], gap_end - 0.001))
+            srt_blocks.append(b)
+            last_global_end_time = max(last_global_end_time, b['end'])
 
     return srt_blocks, last_global_end_time, used_whisper_indices
 
@@ -1005,6 +1020,7 @@ def process_target_path(target_path, run_ocr=False, ocr_only=False, strict_timin
     elif os.path.isdir(target_path):
         for root, _, files in os.walk(target_path):
             for file in files:
+                print(f"Checking file: {file}")
                 if file.lower().endswith(SUPPORTED_EXTS):
                     video_path = os.path.join(root, file)
                     output_srt = os.path.splitext(video_path)[0] + ".srt"
