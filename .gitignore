@@ -1,2 +1,5 @@
 AI_Anime_Subtitle_Generation_Script_1787948437235.pdf
-.cache
+.cache/
+__pycache__/
+*.pyc
+.env
