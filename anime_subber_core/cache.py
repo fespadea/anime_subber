@@ -6,6 +6,23 @@ from pathlib import Path
 from typing import Any, Optional
 
 
+def _json_default(value: Any):
+    """Convert array-library values without importing heavy optional packages."""
+    # NumPy scalars (including int32/float32/bool_) expose item().
+    item = getattr(value, "item", None)
+    if callable(item):
+        converted = item()
+        if converted is not value:
+            return converted
+    # NumPy arrays and similar containers expose tolist().
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        return tolist()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 class CacheStore:
     """Stores every intermediate below the project-local .cache directory."""
 
@@ -51,7 +68,7 @@ class CacheStore:
         fd, temporary = tempfile.mkstemp(prefix=destination.name, suffix=".tmp", dir=destination.parent)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump(value, stream, ensure_ascii=False, indent=2)
+                json.dump(value, stream, ensure_ascii=False, indent=2, default=_json_default)
             os.replace(temporary, destination)
         finally:
             if os.path.exists(temporary):

@@ -12,6 +12,7 @@ This project generates English subtitle tracks by combining Gemini's Japanese tr
   - `cache.py`: project-local cache paths and atomic JSON writes.
   - `gemini.py`, `whisper_engine.py`: model adapters.
   - `ocr.py`: on-screen text detection/translation.
+  - `layout.py`: temporal/spatial collision resolution for ASS cues.
   - `subtitles.py`: SRT/ASS parsing and writing.
   - `pipeline.py`, `cli.py`: orchestration and CLI.
 - `tests/`: tests that must not call Gemini, Whisper, ffmpeg, or a GPU.

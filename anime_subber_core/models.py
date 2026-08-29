@@ -11,6 +11,7 @@ class Subtitle:
     x: Optional[float] = None
     y: Optional[float] = None
     layer: int = 0
+    font_size: Optional[float] = None
 
     def clamp(self, lower: float, upper: float) -> "Subtitle":
         self.start = min(max(lower, self.start), upper)

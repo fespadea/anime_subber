@@ -9,19 +9,32 @@ from .text import parse_llm_json
 
 
 class GeminiManager:
-    def __init__(self, use_lite: bool = False):
+    def __init__(self, use_lite: bool = False, client_factory=None):
         self.models = (["gemini-3.1-flash-lite-preview", "gemini-flash-lite-latest"] if use_lite else
                        ["gemini-flash-latest", "gemini-3.1-flash-lite-preview", "gemini-flash-lite-latest"])
         self.api_exhausted = False
         self._lock = threading.Lock()
         self._client = None
+        self._client_factory = client_factory
 
     @property
     def client(self):
-        if self._client is None:
-            from google import genai
-            self._client = genai.Client()
-        return self._client
+        # Gemini requests start concurrently, so lazy initialization must be
+        # atomic. Otherwise two clients can be created and the SDK finalizer can
+        # close the displaced client while another thread is still using it.
+        with self._lock:
+            if self._client is None:
+                if self._client_factory is None:
+                    from google import genai
+                    self._client = genai.Client()
+                else:
+                    self._client = self._client_factory()
+            return self._client
+
+    def _discard_client(self, client):
+        with self._lock:
+            if self._client is client:
+                self._client = None
 
     def generate(self, contents, config, prefer_lite: bool = False):
         with self._lock:
@@ -29,17 +42,26 @@ class GeminiManager:
         if prefer_lite:
             available.sort(key=lambda model: "lite" not in model)
         for model in available:
-            try:
-                return self.client.models.generate_content(model=model, contents=contents, config=config)
-            except Exception as exc:
-                message = str(exc).lower()
-                if any(word in message for word in ("429", "quota", "exhausted")):
-                    with self._lock:
-                        if model in self.models:
-                            self.models.remove(model)
-                        self.api_exhausted = not self.models
-                else:
-                    print(f"[Gemini] {model} failed: {exc}")
+            for attempt in range(2):
+                active_client = self.client
+                try:
+                    return active_client.models.generate_content(
+                        model=model, contents=contents, config=config
+                    )
+                except Exception as exc:
+                    message = str(exc).lower()
+                    if "client has been closed" in message and attempt == 0:
+                        self._discard_client(active_client)
+                        print("[Gemini] Client was closed unexpectedly; recreating it and retrying once...")
+                        continue
+                    if any(word in message for word in ("429", "quota", "exhausted")):
+                        with self._lock:
+                            if model in self.models:
+                                self.models.remove(model)
+                            self.api_exhausted = not self.models
+                    else:
+                        print(f"[Gemini] {model} failed: {exc}")
+                    break
         return None
 
 

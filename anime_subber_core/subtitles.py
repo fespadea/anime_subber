@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Iterable, List, Tuple
 
 from .models import Subtitle
+from .styling import dialogue_font_size, ocr_font_size, resolution_scale
 
 
 def read_srt(path: str):
@@ -55,6 +56,13 @@ def write_srt(path: str, cues: Iterable[Subtitle]):
 
 def write_ass(path: str, cues: Iterable[Subtitle], resolution: Tuple[int, int] = (1920, 1080)):
     width, height = resolution
+    scale = resolution_scale(resolution)
+    dialogue_size = dialogue_font_size(resolution)
+    sign_size = ocr_font_size(resolution)
+    outline = max(1.2, 2.5 * scale)
+    shadow = max(0.5, 1.0 * scale)
+    dialogue_margin = round(max(16, 40 * scale))
+    sign_margin = round(max(10, 20 * scale))
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {width}
@@ -63,8 +71,8 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Dialogue,Arial,54,&H00FFFFFF,&H000000FF,&H00101010,&H80000000,0,0,0,0,100,100,0,0,1,3,1,2,40,40,40,1
-Style: Sign,Arial,46,&H00FFFFFF,&H000000FF,&H00101010,&H80000000,0,0,0,0,100,100,0,0,1,3,1,5,20,20,20,1
+Style: Dialogue,Arial,{dialogue_size:.2f},&H00FFFFFF,&H000000FF,&H00101010,&H80000000,0,0,0,0,100,100,0,0,1,{outline:.2f},{shadow:.2f},2,{dialogue_margin},{dialogue_margin},{dialogue_margin},1
+Style: Sign,Arial,{sign_size:.2f},&H00FFFFFF,&H000000FF,&H00101010,&H80000000,0,0,0,0,100,100,0,0,1,{outline:.2f},{shadow:.2f},5,{sign_margin},{sign_margin},{sign_margin},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -77,5 +85,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             override = f"{{\\pos({round(cue.x)},{round(cue.y)})}}"
         elif cue.position:
             override = f"{{\\an{cue.position}}}"
+        if cue.font_size is not None:
+            override = override[:-1] + f"\\fs{round(cue.font_size)}}}" if override else f"{{\\fs{round(cue.font_size)}}}"
         events.append(f"Dialogue: {cue.layer},{_ass_time(cue.start)},{_ass_time(cue.end)},{style},,0,0,0,,{override}{_ass_escape(cue.text)}")
     Path(path).write_text(header + "\n".join(events) + "\n", encoding="utf-8-sig")
