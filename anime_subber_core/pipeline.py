@@ -8,6 +8,7 @@ from .config import ORPHAN_GAP_THRESH_SEC, RuntimeConfig, SUPPORTED_EXTS
 from .gemini import GeminiManager, submit_audio_chunks, translate_recovery_slice
 from .ocr import process_video_signs
 from .layout import resolve_collisions
+from .media import load_audio
 from .subtitles import read_srt, write_ass, write_srt
 from .timing import refine_contiguous_starts
 from .whisper_engine import (WhisperGate, load_model, safe_instance_count,
@@ -26,7 +27,6 @@ def _merge_recovery_segments(window, replacements, start, end):
 
 def process_video(video_file, output_path, run_ocr=False, ocr_only=False, use_lite=False,
                   runtime=RuntimeConfig(), whisper_model_name="large", device="cuda"):
-    from pydub import AudioSegment
     cache, manager = CacheStore(), GeminiManager(use_lite)
     cues, resolution, gemini_jobs, whisper_segments = [], (1920, 1080), [], []
     model, gate = None, None
@@ -38,7 +38,7 @@ def process_video(video_file, output_path, run_ocr=False, ocr_only=False, use_li
             cues.extend(read_srt(output_path))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, runtime.gemini_workers)) as pool:
         if not ocr_only:
-            audio = AudioSegment.from_file(video_file)
+            audio = load_audio(video_file, cache)
             gemini_jobs = submit_audio_chunks(audio, video_file, manager, cache, pool)
             count = safe_instance_count(runtime.whisper_workers, whisper_model_name, device)
             gate = WhisperGate(count)
@@ -63,7 +63,8 @@ def process_video(video_file, output_path, run_ocr=False, ocr_only=False, use_li
             window = [s for s in whisper_segments if s.get("end", 0) >= start - 15 and s.get("start", 0) <= end + 15]
             chunk_cues, chunk_used, recovery = align_subtitles(data or [], window, start, end)
             severe = [(gap_start, gap_end, missing) for gap_start, gap_end, missing in recovery
-                      if len(missing) >= 3 and gap_end - gap_start >= 8.0]
+                      if ((len(missing) >= 3 and gap_end - gap_start >= 8.0) or
+                          gap_end - gap_start >= 30.0)]
             if severe:
                 if model is None:
                     print("[Whisper] Loading model for targeted recovery of hallucinated/unmatched spans...")
@@ -73,7 +74,8 @@ def process_video(video_file, output_path, run_ocr=False, ocr_only=False, use_li
                     print(f"[Whisper] Re-transcribing {gap_start:.2f}-{gap_end:.2f}s in short windows "
                           f"for {len(missing)} unmatched line(s)...")
                     replacements = transcribe_targeted(audio, video_file, gap_start, gap_end,
-                                                       model, cache, gate)
+                                                       model, cache, gate,
+                                                       expected_lines=[line.get("ja", "") for line in missing])
                     recovered_window = _merge_recovery_segments(recovered_window, replacements,
                                                                 gap_start, gap_end)
                 retry_cues, retry_used, retry_recovery = align_subtitles(data or [], recovered_window, start, end)
@@ -147,4 +149,9 @@ def process_target(target, output_format="srt", run_ocr=False, ocr_only=False, f
         if output.exists() and not (force_update or ocr_only):
             print(f"Skipping {media} ({output.name} already exists)")
         else:
-            process_video(str(media), str(output), run_ocr, ocr_only, use_lite, runtime, model, device)
+            try:
+                process_video(str(media), str(output), run_ocr, ocr_only, use_lite, runtime, model, device)
+            except Exception as exc:
+                print(f"[Error] Failed to process {media}: {exc}")
+                if path.is_file():
+                    raise

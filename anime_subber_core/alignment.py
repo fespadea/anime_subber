@@ -115,9 +115,18 @@ def _spread_unmatched(indices: Iterable[int], lines: Sequence[dict], start: floa
     if not indexes or end <= start:
         return []
     step = (end - start) / len(indexes)
-    return [Subtitle(start + offset * step,
-                     min(end, max(start + offset * step + 0.30, start + (offset + 1) * step - 0.03)),
-                     str(lines[index].get("en", ""))) for offset, index in enumerate(indexes)]
+    cues = []
+    for offset, index in enumerate(indexes):
+        text = str(lines[index].get("en", ""))
+        cue_start = start + offset * step
+        # Unmatched fallback cues must never fill a huge anchor gap. Estimate a
+        # readable duration and cap it at six seconds inside this line's slot.
+        readable_duration = min(6.0, max(1.2, 0.8 + len(text) / 15.0))
+        slot_end = start + (offset + 1) * step
+        cue_end = min(end, slot_end - 0.03, cue_start + readable_duration)
+        cue_end = max(cue_start + min(0.30, end - cue_start), cue_end)
+        cues.append(Subtitle(cue_start, cue_end, text))
+    return cues
 
 
 def align_subtitles(gemini_lines: Sequence[dict], whisper_segments: Sequence[dict],

@@ -21,6 +21,21 @@ class WhisperRecoveryTests(unittest.TestCase):
         self.assertTrue(model.options["word_timestamps"])
         self.assertEqual(model.options["hallucination_silence_threshold"], 2.0)
 
+    def test_prompted_recovery_forces_confirmed_lyrics(self):
+        class Model:
+            def __init__(self):
+                self.options = None
+
+            def transcribe(self, _path, **options):
+                self.options = options
+                return {"segments": []}
+
+        model = Model()
+        _transcribe(model, "song.wav", initial_prompt="凍えそうな都会。せわしない音階", force_speech=True)
+        self.assertEqual(model.options["initial_prompt"], "凍えそうな都会。せわしない音階")
+        self.assertIsNone(model.options["no_speech_threshold"])
+        self.assertIsNone(model.options["logprob_threshold"])
+
     def test_targeted_segments_replace_hallucinated_span(self):
         original = [
             {"start": 0, "end": 20, "text": "valid"},

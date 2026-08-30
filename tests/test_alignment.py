@@ -37,6 +37,13 @@ class AlignmentTests(unittest.TestCase):
         self.assertEqual(next(c for c in cues if c.text == "Last words").start, 42.0)
         self.assertTrue(all(0 <= c.start < c.end <= 45 for c in cues))
 
+    def test_single_unmatched_line_does_not_fill_a_huge_gap(self):
+        gemini = [{"ja": "認識できない台詞", "en": "A short unmatched subtitle."}]
+        cues, _, recovery = align_subtitles(gemini, [], 0, 240)
+        self.assertEqual(len(cues), 1)
+        self.assertLessEqual(cues[0].end - cues[0].start, 6.0)
+        self.assertEqual((recovery[0][0], recovery[0][1]), (0, 240))
+
     def test_matches_are_monotonic(self):
         lines = [{"ja": value, "en": value} for value in ("甲です", "乙です", "丙です")]
         segments = [{"text": value, "start": i, "end": i + .5} for i, value in enumerate(("甲です", "雑音", "乙です", "丙です"))]
