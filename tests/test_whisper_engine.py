@@ -1,10 +1,29 @@
 import unittest
 
-from anime_subber_core.pipeline import _merge_recovery_segments
-from anime_subber_core.whisper_engine import _transcribe
+from anime_subber_core.models import Subtitle
+from anime_subber_core.pipeline import _bound_cues, _merge_recovery_segments
+from anime_subber_core.whisper_engine import _transcribe, bound_segments
 
 
 class WhisperRecoveryTests(unittest.TestCase):
+    def test_padded_final_window_is_clipped_to_audio_duration(self):
+        segments = [
+            {"start": 30.0, "end": 59.98, "text": "real tail"},
+            {"start": 40.0, "end": 59.98, "text": "padding hallucination"},
+        ]
+        bounded = bound_segments(segments, 33.321)
+        self.assertEqual(len(bounded), 1)
+        self.assertEqual(bounded[0]["end"], 33.321)
+
+    def test_final_cue_boundary_catches_recovery_output(self):
+        cues = [
+            Subtitle(30.0, 44.96, "tail"),
+            Subtitle(44.99, 59.95, "padding"),
+        ]
+        bounded = _bound_cues(cues, 33.321)
+        self.assertEqual(len(bounded), 1)
+        self.assertEqual((bounded[0].start, bounded[0].end), (30.0, 33.321))
+
     def test_full_transcription_uses_anti_hallucination_options(self):
         class Model:
             def __init__(self):

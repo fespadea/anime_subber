@@ -63,10 +63,31 @@ def _transcribe(model, audio_path, initial_prompt=None, force_speech=False):
         return model.transcribe(audio_path, **options)
 
 
+def bound_segments(segments, duration: float):
+    """Return only the part of Whisper's output that exists in the source audio.
+
+    Whisper decodes in padded 30-second windows and can occasionally expose the
+    padding as timestamps (for example, 30-59.98 for a 33-second clip).
+    """
+    bounded = []
+    duration = max(0.0, float(duration))
+    for segment in segments:
+        start = max(0.0, float(segment.get("start", 0)))
+        end = min(duration, float(segment.get("end", 0)))
+        if start >= duration or end <= start:
+            continue
+        item = dict(segment)
+        item["start"] = start
+        item["end"] = end
+        bounded.append(item)
+    return bounded
+
+
 def transcribe_full(audio, media_path: str, model, cache: CacheStore, gate: WhisperGate):
+    duration = len(audio) / 1000.0
     cached = cache.load_json(media_path, "whisper_v2")
     if cached is not None:
-        segments = cached
+        segments = bound_segments(cached, duration)
     else:
         handle, temporary = tempfile.mkstemp(suffix=".wav", dir=cache.media_dir(media_path))
         os.close(handle)
@@ -74,7 +95,7 @@ def transcribe_full(audio, media_path: str, model, cache: CacheStore, gate: Whis
             audio.export(temporary, format="wav")
             with gate.inference():
                 result = _transcribe(model, temporary)
-            segments = result.get("segments", [])
+            segments = bound_segments(result.get("segments", []), duration)
             cache.save_json(media_path, "whisper_v2", segments)
         finally:
             if os.path.exists(temporary):

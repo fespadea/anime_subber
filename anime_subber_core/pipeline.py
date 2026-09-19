@@ -12,7 +12,7 @@ from .media import load_audio
 from .subtitles import read_srt, write_ass, write_srt
 from .timing import refine_contiguous_starts
 from .whisper_engine import (WhisperGate, load_model, safe_instance_count,
-                             transcribe_full, transcribe_targeted)
+                             bound_segments, transcribe_full, transcribe_targeted)
 
 
 def _missing_count(recovery):
@@ -25,10 +25,22 @@ def _merge_recovery_segments(window, replacements, start, end):
     return sorted(kept + replacements, key=lambda segment: (segment.get("start", 0), segment.get("end", 0)))
 
 
+def _bound_cues(cues, duration):
+    """Clip cues to playable media and discard cues wholly inside decoder padding."""
+    bounded = []
+    for cue in cues:
+        cue.start = max(0.0, cue.start)
+        cue.end = min(duration, cue.end)
+        if cue.start < duration and cue.end > cue.start:
+            bounded.append(cue)
+    return bounded
+
+
 def process_video(video_file, output_path, run_ocr=False, ocr_only=False, use_lite=False,
                   runtime=RuntimeConfig(), whisper_model_name="large", device="cuda"):
     cache, manager = CacheStore(), GeminiManager(use_lite)
     cues, resolution, gemini_jobs, whisper_segments = [], (1920, 1080), [], []
+    media_duration = None
     model, gate = None, None
     if ocr_only and Path(output_path).exists():
         backup = str(cache.media_dir(video_file) / (Path(output_path).name + ".bak"))
@@ -39,12 +51,13 @@ def process_video(video_file, output_path, run_ocr=False, ocr_only=False, use_li
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, runtime.gemini_workers)) as pool:
         if not ocr_only:
             audio = load_audio(video_file, cache)
+            media_duration = len(audio) / 1000.0
             gemini_jobs = submit_audio_chunks(audio, video_file, manager, cache, pool)
             count = safe_instance_count(runtime.whisper_workers, whisper_model_name, device)
             gate = WhisperGate(count)
             cached_whisper = cache.load_json(video_file, "whisper_v2")
             if cached_whisper is not None:
-                whisper_segments = cached_whisper
+                whisper_segments = bound_segments(cached_whisper, media_duration)
                 for index, segment in enumerate(whisper_segments):
                     segment["global_idx"] = index
             else:
@@ -104,7 +117,8 @@ def process_video(video_file, output_path, run_ocr=False, ocr_only=False, use_li
             orphan_blocks.append(current)
         recovery_jobs = []
         for index, block in enumerate(orphan_blocks, 1):
-            start, end = float(block[0]["start"]), float(block[-1]["end"])
+            start = max(0.0, float(block[0]["start"]))
+            end = min(media_duration, float(block[-1]["end"]))
             if end - start > ORPHAN_GAP_THRESH_SEC:
                 recovery_jobs.append((block, pool.submit(translate_recovery_slice, audio, video_file, start, end,
                                                         f"gemini_recovery_{round(start * 1000)}_{round(end * 1000)}",
@@ -128,6 +142,8 @@ def process_video(video_file, output_path, run_ocr=False, ocr_only=False, use_li
         if duplicate is None:
             deduplicated.append(cue)
     cues = deduplicated
+    if media_duration is not None:
+        cues = _bound_cues(cues, media_duration)
     if runtime.strict_timing and not ocr_only:
         refine_contiguous_starts(cues, audio)
     if output_path.lower().endswith(".ass"):
