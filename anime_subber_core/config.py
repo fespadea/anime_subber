@@ -16,3 +16,4 @@ class RuntimeConfig:
     whisper_workers: int = 1
     ocr_gpu: bool = False
     strict_timing: bool = False
+    ocr_vision_rescue: bool = True

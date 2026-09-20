@@ -1,7 +1,8 @@
 import unittest
 from unittest.mock import patch
 
-from anime_subber_core.gemini import GeminiManager, _audio_lines, _translation_items
+from anime_subber_core.gemini import (GeminiManager, _audio_lines,
+                                      _translation_items, _vision_items)
 
 
 class GeminiValidationTests(unittest.TestCase):
@@ -13,6 +14,12 @@ class GeminiValidationTests(unittest.TestCase):
     def test_translation_ids_are_normalized(self):
         self.assertEqual(_translation_items([{"id": "2", "en": "Station"}]),
                          [{"id": 2, "en": "Station"}])
+
+    def test_vision_ocr_ids_are_normalized_and_empty_items_are_ignored(self):
+        self.assertEqual(
+            _vision_items([{"id": "2", "ja": "私達"}, {"id": 3, "ja": ""}, "bad"]),
+            [{"id": 2, "ja": "私達"}],
+        )
 
     def test_transient_rate_limit_is_retried_before_model_is_dropped(self):
         class Models:

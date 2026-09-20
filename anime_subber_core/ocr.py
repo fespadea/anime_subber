@@ -1,10 +1,12 @@
 """On-screen Japanese text detection and translation (kept separate from audio alignment)."""
 import concurrent.futures
+import hashlib
 import re
 from typing import List, Tuple
 
 from .cache import CacheStore
-from .gemini import GeminiManager, translate_text_batch
+from .gemini import (GeminiManager, recognize_japanese_image_batch,
+                     translate_text_batch)
 from .models import Subtitle
 from .similarity import ratio
 from .text import normalize_text
@@ -16,9 +18,25 @@ _LATIN = re.compile(r"[A-Za-z]")
 
 
 # OCR cache versions are intentionally tied to the detection/layout algorithm.
-# v6 adds vertical Japanese reconstruction/right-to-left column ordering and
-# Unicode-aware normalization for more stable frame-to-frame matching.
-_OCR_CACHE_VERSION = "v6"
+# v7 adds permissive text detection, geometry-first vertical rescue, Gemini
+# vision verification for tategaki crops, and more stable spatial tracking.
+_OCR_CACHE_VERSION = "v7"
+
+
+_EASYOCR_READTEXT_KWARGS = {
+    # CRAFT's defaults are conservative for thin handwritten anime text. Keep
+    # recognition filtering strict downstream, but ask the detector to retain
+    # weaker candidate boxes so vertical geometry can rescue them.
+    "detail": 1,
+    "paragraph": False,
+    "text_threshold": 0.50,
+    "low_text": 0.25,
+    "link_threshold": 0.25,
+    "canvas_size": 3840,
+    "mag_ratio": 1.50,
+    "min_size": 8,
+    "add_margin": 0.12,
+}
 
 
 def contains_japanese(text: str) -> bool:
@@ -54,6 +72,55 @@ def _bbox_metrics(bbox):
         "cx": (left + right) / 2.0,
         "cy": (top + bottom) / 2.0,
     }
+
+
+def _bbox_area(bbox):
+    metrics = _bbox_metrics(bbox)
+    return metrics["width"] * metrics["height"]
+
+
+def _bbox_iou(first, second):
+    a = _bbox_metrics(first)
+    b = _bbox_metrics(second)
+    left, top = max(a["left"], b["left"]), max(a["top"], b["top"])
+    right, bottom = min(a["right"], b["right"]), min(a["bottom"], b["bottom"])
+    intersection = max(0.0, right - left) * max(0.0, bottom - top)
+    if intersection <= 0:
+        return 0.0
+    union = a["width"] * a["height"] + b["width"] * b["height"] - intersection
+    return intersection / max(1.0, union)
+
+
+def _same_region(first, second, width, height, loose=False):
+    """Spatial sign identity independent of OCR wording.
+
+    OCR text is unstable for stylized signs, especially tategaki. A nested box
+    or strong IoU is therefore stronger tracking evidence than exact text.
+    ``loose`` is reserved for geometry-only vertical rescue candidates.
+    """
+    one, two = _bbox_metrics(first), _bbox_metrics(second)
+    x_limit = max(70.0, width * (0.10 if loose else 0.07))
+    y_limit = max(55.0, height * (0.10 if loose else 0.07))
+    if abs(one["cx"] - two["cx"]) > x_limit or abs(one["cy"] - two["cy"]) > y_limit:
+        return False
+    if _bbox_iou(first, second) >= (0.32 if loose else 0.55):
+        return True
+    return _spatially_nested(first, second, threshold=0.52 if loose else 0.68)
+
+
+def _coerce_detection(detection):
+    if not isinstance(detection, (list, tuple)) or len(detection) < 3:
+        return None
+    bbox, text, confidence = detection[:3]
+    try:
+        native_bbox = [[float(point[0]), float(point[1])] for point in bbox]
+        confidence = float(confidence)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if len(native_bbox) < 4:
+        return None
+    text = str(text or "")
+    return native_bbox, text, confidence, normalize_text(text)
 
 
 def _enclosing_bbox(boxes):
@@ -205,14 +272,13 @@ def _prepare_detections(raw_detections):
     """
     candidates = []
     for detection in raw_detections:
-        if not isinstance(detection, (list, tuple)) or len(detection) < 3:
+        candidate = _coerce_detection(detection)
+        if candidate is None:
             continue
-        bbox, text, confidence = detection[:3]
-        norm = normalize_text(text)
-        if float(confidence) < 0.30 or not norm or not contains_japanese(text):
+        bbox, text, confidence, norm = candidate
+        if confidence < 0.30 or not norm or not contains_japanese(text):
             continue
-        native_bbox = [[float(point[0]), float(point[1])] for point in bbox]
-        candidates.append((native_bbox, text, float(confidence), norm))
+        candidates.append((bbox, text, confidence, norm))
 
     # Prefer the largest/best rendering of a nested duplicate, but do this before
     # vertical grouping so duplicate character boxes do not create fake columns.
@@ -251,6 +317,79 @@ def _prepare_detections(raw_detections):
     return results
 
 
+def _looks_like_vertical_region(group):
+    """Geometry-only vertical candidate test for weak/garbled OCR results."""
+    if not group:
+        return False
+    box = _enclosing_bbox([item[0] for item in group])
+    metrics = _bbox_metrics(box)
+    if metrics["height"] < 24 or metrics["width"] < 4:
+        return False
+    if len(group) == 1:
+        # A detector may give one tall box even when recognition fails.
+        return metrics["height"] >= metrics["width"] * 1.45
+    # Multiple stacked boxes are a stronger vertical signal, so a slightly
+    # lower aspect ratio is acceptable for handwritten/multi-glyph regions.
+    return metrics["height"] >= metrics["width"] * 1.10
+
+
+def _merge_vertical_region_boxes(columns):
+    merged = []
+    for group in _union_groups(columns, _vertical_columns_belong_together):
+        merged.append(_enclosing_bbox([item[0] for item in group]))
+    return merged
+
+
+def _vertical_rescue_regions(raw_detections, prepared, width, height):
+    """Find likely tategaki regions even when recognition itself is unusable.
+
+    EasyOCR's detector can often localize thin vertical text while its recognizer
+    returns low-confidence Latin/punctuation garbage. Previous code discarded
+    those boxes before vertical reconstruction, which made recovery impossible.
+    This pass uses box geometry first and leaves recognition to Gemini vision.
+    """
+    raw = []
+    for detection in raw_detections:
+        candidate = _coerce_detection(detection)
+        if candidate is None:
+            continue
+        bbox, text, confidence, norm = candidate
+        metrics = _bbox_metrics(bbox)
+        # Keep very weak recognitions, but reject microscopic and implausibly
+        # huge regions that are typically detector noise/artwork edges.
+        if confidence < 0.01:
+            continue
+        if metrics["width"] < 4 or metrics["height"] < 6:
+            continue
+        if metrics["width"] > width * 0.70 or metrics["height"] > height * 0.92:
+            continue
+        raw.append((bbox, text, confidence, norm))
+
+    columns = []
+    for group in _union_groups(raw, _vertical_fragment_pair):
+        if not _looks_like_vertical_region(group):
+            continue
+        confidence = max((item[2] for item in group), default=0.0)
+        columns.append((_enclosing_bbox([item[0] for item in group]), "", confidence, "", "vertical"))
+
+    regions = _merge_vertical_region_boxes(columns) if columns else []
+    prepared_vertical = [item[0] for item in prepared if item[4] == "vertical"]
+    result = []
+    for bbox in regions:
+        # A successfully reconstructed vertical detection already has Japanese
+        # text. It will still be vision-verified later; don't emit a duplicate
+        # geometry-only candidate for the same box.
+        if any(_same_region(bbox, existing, width, height, loose=True)
+               for existing in prepared_vertical):
+            continue
+        metrics = _bbox_metrics(bbox)
+        # Ignore regions that are technically tall but only by a few pixels.
+        if metrics["height"] < max(32.0, height * 0.025):
+            continue
+        result.append(bbox)
+    return result
+
+
 def _position(bbox, width: float, height: float) -> Tuple[int, float, float]:
     x = sum(p[0] for p in bbox) / len(bbox)
     y = sum(p[1] for p in bbox) / len(bbox)
@@ -269,11 +408,27 @@ def _resolution(video_file: str):
 
 
 def _read_detections(reader, image):
-    """Run EasyOCR with detail needed for vertical reconstruction."""
-    return _prepare_detections(reader.readtext(image, detail=1, paragraph=False))
+    """Run a recall-oriented EasyOCR pass, then apply strict text filtering."""
+    raw = reader.readtext(image, **_EASYOCR_READTEXT_KWARGS)
+    return _prepare_detections(raw)
 
 
-def _frame_has_sign(cap, reader, frame_index, norm_target, bbox):
+def _read_frame_ocr(reader, image):
+    """Return recognized signs plus geometry-only vertical rescue regions."""
+    height, width = image.shape[:2]
+    raw = reader.readtext(image, **_EASYOCR_READTEXT_KWARGS)
+    prepared = _prepare_detections(raw)
+    rescue = _vertical_rescue_regions(raw, prepared, width, height)
+    return prepared, rescue
+
+
+def _region_matches_target(candidate_bbox, target_bbox, crop_width, crop_height):
+    # Coordinates are local to the same crop. Be somewhat permissive because
+    # EasyOCR can resize/merge the same vertical line differently frame-to-frame.
+    return _same_region(candidate_bbox, target_bbox, crop_width, crop_height, loose=True)
+
+
+def _frame_has_sign(cap, reader, frame_index, norm_target, bbox, spatial_only=False):
     """Check one localized frame for a sign during boundary refinement."""
     import cv2
     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
@@ -287,34 +442,151 @@ def _frame_has_sign(cap, reader, frame_index, norm_target, bbox):
     if x2 <= x1 or y2 <= y1:
         return False
     crop = frame[y1:y2, x1:x2]
+    if spatial_only:
+        detected, rescue = _read_frame_ocr(reader, crop)
+        # Translate the target box into crop-local coordinates.
+        local_target = [[point[0] - x1, point[1] - y1] for point in bbox]
+        boxes = [item[0] for item in detected if item[4] == "vertical"] + rescue
+        return any(_region_matches_target(candidate, local_target, crop.shape[1], crop.shape[0])
+                   for candidate in boxes)
+
     detected = _read_detections(reader, crop)
     return any(ratio(norm_target, norm) >= 78 or norm_target in norm or norm in norm_target
                for _, _, _, norm, _ in detected)
 
 
-def _first_visible_frame(cap, reader, hit_frame, stride, norm_target, bbox):
+def _first_visible_frame(cap, reader, hit_frame, stride, norm_target, bbox, spatial_only=False):
     low, high, first = max(0, hit_frame - stride + 1), hit_frame, hit_frame
     while low <= high:
         middle = (low + high) // 2
-        if _frame_has_sign(cap, reader, middle, norm_target, bbox):
+        visible = (_frame_has_sign(cap, reader, middle, norm_target, bbox, spatial_only=True)
+                   if spatial_only else
+                   _frame_has_sign(cap, reader, middle, norm_target, bbox))
+        if visible:
             first, high = middle, middle - 1
         else:
             low = middle + 1
     return first
 
 
-def _last_visible_frame(cap, reader, last_hit, first_miss, norm_target, bbox):
+def _last_visible_frame(cap, reader, last_hit, first_miss, norm_target, bbox, spatial_only=False):
     low, high, last = last_hit, max(last_hit, first_miss - 1), last_hit
     while low <= high:
         middle = (low + high) // 2
-        if _frame_has_sign(cap, reader, middle, norm_target, bbox):
+        visible = (_frame_has_sign(cap, reader, middle, norm_target, bbox, spatial_only=True)
+                   if spatial_only else
+                   _frame_has_sign(cap, reader, middle, norm_target, bbox))
+        if visible:
             last, low = middle, middle + 1
         else:
             high = middle - 1
     return last
 
 
-def detect_signs(video_file: str, cache: CacheStore, gpu=False, sample_seconds=1.0):
+def _text_track_match(norm, existing_norm):
+    if not norm or not existing_norm:
+        return False
+    return (ratio(norm, existing_norm) >= 82 or norm in existing_norm or existing_norm in norm)
+
+
+def _track_match(sign, bbox, norm, orientation, width, height):
+    """Match a frame detection to an active sign using space first, text second."""
+    rescue = orientation == "vertical_rescue" or sign.get("needs_vision", False)
+    if not _same_region(bbox, sign["bbox"], width, height, loose=rescue):
+        return False
+    if rescue:
+        return True
+    if _text_track_match(norm, sign.get("norm_text", "")):
+        return True
+    # Very stable geometry can bridge moderate OCR wording changes without
+    # merging unrelated signs that merely occupy the same screen quadrant.
+    return _bbox_iou(bbox, sign["bbox"]) >= 0.72 and ratio(norm, sign.get("norm_text", "")) >= 35
+
+
+def _sample_score(bbox, confidence, norm):
+    # Prefer a complete/larger rendering and, secondarily, stronger recognition.
+    return _bbox_area(bbox) * (0.25 + max(0.0, confidence)) * (1.0 + min(12, len(norm)) / 12.0)
+
+
+def _crop_frame_jpeg(video_file, frame_index, bbox):
+    """Extract a generously padded representative crop for Gemini vision."""
+    import cv2
+
+    cap = cv2.VideoCapture(video_file)
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(frame_index)))
+        ok, frame = cap.read()
+        if not ok:
+            return None
+    finally:
+        cap.release()
+
+    frame_height, frame_width = frame.shape[:2]
+    metrics = _bbox_metrics(bbox)
+    pad_x = max(24, round(metrics["width"] * 0.28))
+    pad_y = max(18, round(metrics["height"] * 0.08))
+    x1 = max(0, round(metrics["left"]) - pad_x)
+    x2 = min(frame_width, round(metrics["right"]) + pad_x)
+    y1 = max(0, round(metrics["top"]) - pad_y)
+    y2 = min(frame_height, round(metrics["bottom"]) + pad_y)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    crop = frame[y1:y2, x1:x2]
+    ok, encoded = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    return encoded.tobytes() if ok else None
+
+
+def _resolve_vertical_vision(signs, video_file, manager, executor, batch_size=12):
+    """Verify/recover vertical Japanese using Gemini on representative crops."""
+    pending = []
+    for sign in signs:
+        if not sign.get("needs_vision"):
+            continue
+        image = _crop_frame_jpeg(video_file, sign.get("sample_frame", sign.get("last_seen_frame", 0)),
+                                 sign["bbox"])
+        if image:
+            pending.append((sign, image))
+
+    def recognize(batch):
+        items = [{"id": index, "image_bytes": image}
+                 for index, (_sign, image) in enumerate(batch)]
+        data = recognize_japanese_image_batch(items, manager)
+        mapping = {int(item["id"]): item["ja"] for item in data}
+        return [(sign, mapping.get(index, "")) for index, (sign, _image) in enumerate(batch)]
+
+    futures = []
+    for offset in range(0, len(pending), batch_size):
+        futures.append(executor.submit(recognize, pending[offset:offset + batch_size]))
+
+    for future in futures:
+        for sign, japanese in future.result():
+            japanese = str(japanese or "").strip()
+            if japanese and contains_japanese(japanese):
+                sign["ja_text"] = japanese
+                sign["norm_text"] = normalize_text(japanese)
+                sign["orientation"] = "vertical"
+                sign["vision_verified"] = True
+
+    # Geometry-only false positives have no source text to translate. If Gemini
+    # was unavailable, keep vertical signs that EasyOCR had already recognized.
+    return [sign for sign in signs if sign.get("norm_text")]
+
+
+def _sign_fingerprint(sign):
+    """Stable-enough provenance token for future ASS OCR refreshes."""
+    metrics = _bbox_metrics(sign.get("bbox") or [[0, 0], [0, 0], [0, 0], [0, 0]])
+    payload = "|".join((
+        normalize_text(sign.get("ja_text", "")),
+        str(round(metrics["cx"] / 16)),
+        str(round(metrics["cy"] / 16)),
+        str(round(metrics["width"] / 16)),
+        str(round(metrics["height"] / 16)),
+    ))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def detect_signs(video_file: str, cache: CacheStore, gpu=False, sample_seconds=1.0,
+                 manager=None, executor=None, vision_rescue=True):
     cache_name = f"ocr_signs_{_OCR_CACHE_VERSION}"
     cached = cache.load_json(video_file, cache_name)
     if cached is not None:
@@ -332,8 +604,10 @@ def detect_signs(video_file: str, cache: CacheStore, gpu=False, sample_seconds=1
                 else:
                     sign["x"], sign["y"] = resolution[0] / 2, resolution[1] / 2
         return cached, resolution
+
     import cv2
     import easyocr
+
     cap = cv2.VideoCapture(video_file)
     fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
     width, height = _resolution(video_file)
@@ -341,6 +615,16 @@ def detect_signs(video_file: str, cache: CacheStore, gpu=False, sample_seconds=1
     stride = max(1, round(fps * sample_seconds))
     reader = easyocr.Reader(["ja", "en"], gpu=gpu, verbose=False)
     active, finished = [], []
+
+    def finish(sign, first_miss):
+        spatial_only = bool(sign.get("needs_vision"))
+        last_frame = _last_visible_frame(
+            cap, reader, sign["last_seen_frame"], first_miss, sign.get("norm_text", ""),
+            sign["bbox"], spatial_only=spatial_only,
+        )
+        sign["end"] = min(total / fps, (last_frame + 1) / fps)
+        finished.append(sign)
+
     try:
         for frame_index in range(0, total, stride):
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
@@ -349,67 +633,126 @@ def detect_signs(video_file: str, cache: CacheStore, gpu=False, sample_seconds=1
                 break
             now = frame_index / fps
             seen = set()
-            for bbox, text, confidence, norm, orientation in _read_detections(reader, frame):
+
+            if vision_rescue:
+                recognized, rescue_boxes = _read_frame_ocr(reader, frame)
+                frame_detections = list(recognized) + [
+                    (bbox, "", 0.0, "", "vertical_rescue") for bbox in rescue_boxes
+                ]
+            else:
+                frame_detections = _read_detections(reader, frame)
+
+            for bbox, text, confidence, norm, orientation in frame_detections:
+                needs_vision = vision_rescue and orientation in ("vertical", "vertical_rescue")
                 _, detected_x, detected_y = _position(bbox, width, height)
-                found = next((i for i, sign in enumerate(active)
-                              if (ratio(norm, sign["norm_text"]) >= 82 or
-                                  norm in sign["norm_text"] or sign["norm_text"] in norm) and
-                              _spatially_nested(bbox, sign["bbox"], threshold=0.55) and
-                              abs(detected_x - sign["x"]) <= max(80, width * 0.08) and
-                              abs(detected_y - sign["y"]) <= max(60, height * 0.08)), None)
+                found = next((
+                    index for index, sign in enumerate(active)
+                    if _track_match(sign, bbox, norm, orientation, width, height)
+                ), None)
+
+                score = _sample_score(bbox, confidence, norm)
                 if found is None:
                     pos, x, y = _position(bbox, width, height)
-                    first_frame = _first_visible_frame(cap, reader, frame_index, stride, norm, bbox)
-                    active.append({"start": first_frame / fps, "last_seen": now,
-                                   "last_seen_frame": frame_index, "ja_text": text, "norm_text": norm,
-                                   "bbox": bbox, "pos": pos, "x": x, "y": y,
-                                   "orientation": orientation})
+                    first_frame = _first_visible_frame(
+                        cap, reader, frame_index, stride, norm, bbox, spatial_only=needs_vision
+                    )
+                    active.append({
+                        "start": first_frame / fps,
+                        "last_seen": now,
+                        "last_seen_frame": frame_index,
+                        "ja_text": text,
+                        "norm_text": norm,
+                        "bbox": bbox,
+                        "pos": pos,
+                        "x": x,
+                        "y": y,
+                        "orientation": "vertical" if needs_vision else orientation,
+                        "confidence": confidence,
+                        "needs_vision": needs_vision,
+                        "sample_frame": frame_index,
+                        "sample_score": score,
+                    })
                     found = len(active) - 1
                 else:
-                    if len(norm) > len(active[found]["norm_text"]):
-                        active[found].update({"ja_text": text, "norm_text": norm, "bbox": bbox,
-                                              "x": detected_x, "y": detected_y,
-                                              "orientation": orientation})
-                    active[found]["last_seen"] = now
-                    active[found]["last_seen_frame"] = frame_index
+                    sign = active[found]
+                    if needs_vision:
+                        sign["needs_vision"] = True
+                        sign["orientation"] = "vertical"
+                    # Retain the strongest/most complete source transcription,
+                    # but track presence primarily from geometry.
+                    if norm and (
+                        len(norm) > len(sign.get("norm_text", "")) or
+                        confidence > sign.get("confidence", 0.0) + 0.12
+                    ):
+                        sign["ja_text"] = text
+                        sign["norm_text"] = norm
+                        sign["confidence"] = confidence
+                    if score > sign.get("sample_score", -1):
+                        pos, x, y = _position(bbox, width, height)
+                        sign.update({
+                            "bbox": bbox, "pos": pos, "x": x, "y": y,
+                            "sample_frame": frame_index, "sample_score": score,
+                        })
+                    sign["last_seen"] = now
+                    sign["last_seen_frame"] = frame_index
                 seen.add(found)
+
             for index in reversed(range(len(active))):
                 if index not in seen and now - active[index]["last_seen"] >= sample_seconds:
-                    sign = active.pop(index)
-                    last_frame = _last_visible_frame(cap, reader, sign["last_seen_frame"], frame_index,
-                                                     sign["norm_text"], sign["bbox"])
-                    sign["end"] = min(total / fps, (last_frame + 1) / fps)
-                    finished.append(sign)
+                    finish(active.pop(index), frame_index)
     finally:
         cap.release()
+
     duration = total / fps
     if active:
         boundary_cap = cv2.VideoCapture(video_file)
         try:
+            # ``finish`` closes over ``cap`` which has now been released, so do
+            # the final boundary refinement against a fresh capture explicitly.
             for sign in active:
-                last_frame = _last_visible_frame(boundary_cap, reader, sign["last_seen_frame"], total,
-                                                 sign["norm_text"], sign["bbox"])
+                last_frame = _last_visible_frame(
+                    boundary_cap, reader, sign["last_seen_frame"], total,
+                    sign.get("norm_text", ""), sign["bbox"],
+                    spatial_only=bool(sign.get("needs_vision")),
+                )
                 sign["end"] = min(duration, (last_frame + 1) / fps)
                 finished.append(sign)
         finally:
             boundary_cap.release()
+
+    if vision_rescue and manager is not None and executor is not None:
+        finished = _resolve_vertical_vision(finished, video_file, manager, executor)
+    else:
+        # Pure geometry candidates cannot be translated without the vision pass.
+        finished = [sign for sign in finished if sign.get("norm_text")]
+
     # A final containment pass catches a component that was intermittently
     # recognized as a separate sign on different sampled frames.
     deduplicated = []
-    for sign in sorted(finished, key=lambda item: (-len(item["norm_text"]), item["start"])):
-        parent = next((kept for kept in deduplicated
-                       if min(sign["end"], kept["end"]) - max(sign["start"], kept["start"]) > 0.05 and
-                       _spatially_nested(sign["bbox"], kept["bbox"]) and
-                       (sign["norm_text"] in kept["norm_text"] or kept["norm_text"] in sign["norm_text"])), None)
+    for sign in sorted(finished, key=lambda item: (-len(item.get("norm_text", "")), item["start"])):
+        parent = next((
+            kept for kept in deduplicated
+            if min(sign["end"], kept["end"]) - max(sign["start"], kept["start"]) > 0.05
+            and _same_region(sign["bbox"], kept["bbox"], width, height,
+                             loose=(sign.get("orientation") == "vertical" or
+                                    kept.get("orientation") == "vertical"))
+            and (_text_track_match(sign.get("norm_text", ""), kept.get("norm_text", ""))
+                 or ratio(sign.get("norm_text", ""), kept.get("norm_text", "")) >= 55)
+        ), None)
         if parent:
             parent["start"] = min(parent["start"], sign["start"])
             parent["end"] = max(parent["end"], sign["end"])
         else:
             deduplicated.append(sign)
+
+    # Internal tracking fields do not belong in the persistent OCR cache.
+    for sign in deduplicated:
+        for key in ("confidence", "needs_vision", "sample_frame", "sample_score"):
+            sign.pop(key, None)
+
     finished = sorted(deduplicated, key=lambda item: item["start"])
     cache.save_json(video_file, cache_name, finished)
     return finished, (width, height)
-
 
 def translate_signs(signs, video_file: str, manager: GeminiManager, cache: CacheStore,
                     executor: concurrent.futures.Executor) -> List[Subtitle]:
@@ -434,7 +777,8 @@ def translate_signs(signs, video_file: str, manager: GeminiManager, cache: Cache
             if english:
                 mapping[identifier] = english
         return [Subtitle(float(sign["start"]), float(sign["end"]), f"[{mapping[i]}]",
-                         int(sign["pos"]), float(sign["x"]), float(sign["y"]), 1)
+                         int(sign["pos"]), float(sign["x"]), float(sign["y"]), 1,
+                         effect=f"anime_subber_ocr:{_sign_fingerprint(sign)}")
                 for i, sign in enumerate(batch) if mapping.get(i)]
 
     batches = [signs[i:i + 50] for i in range(0, len(signs), 50)]
@@ -442,6 +786,7 @@ def translate_signs(signs, video_file: str, manager: GeminiManager, cache: Cache
     return [cue for future in futures for cue in future.result()]
 
 
-def process_video_signs(video_file, manager, cache, executor, gpu=False):
-    signs, resolution = detect_signs(video_file, cache, gpu)
+def process_video_signs(video_file, manager, cache, executor, gpu=False, vision_rescue=True):
+    signs, resolution = detect_signs(video_file, cache, gpu, manager=manager, executor=executor,
+                                     vision_rescue=vision_rescue)
     return translate_signs(signs, video_file, manager, cache, executor), resolution

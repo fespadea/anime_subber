@@ -9,7 +9,9 @@ from .gemini import GeminiManager, submit_audio_chunks, translate_recovery_slice
 from .ocr import process_video_signs
 from .layout import resolve_collisions
 from .media import load_audio
+from .similarity import ratio
 from .subtitles import read_ass, read_srt, write_ass, write_srt
+from .text import normalize_text
 from .timing import refine_contiguous_starts
 from .whisper_engine import (WhisperGate, load_model, safe_instance_count,
                              bound_segments, transcribe_full, transcribe_targeted)
@@ -36,22 +38,47 @@ def _bound_cues(cues, duration):
     return bounded
 
 
+def _same_ocr_sign(old, cue, resolution=(1920, 1080)):
+    overlap = min(old.end, cue.end) - max(old.start, cue.start)
+    shorter = min(old.end - old.start, cue.end - cue.start)
+    if overlap <= 0.05 or shorter <= 0 or overlap / shorter < 0.60:
+        return False
+
+    if old.effect and cue.effect and old.effect == cue.effect:
+        return True
+
+    x_tolerance = max(32.0, resolution[0] * 0.025)
+    y_tolerance = max(32.0, resolution[1] * 0.040)
+    if None not in (old.x, old.y, cue.x, cue.y):
+        if abs(old.x - cue.x) > x_tolerance or abs(old.y - cue.y) > y_tolerance:
+            return False
+    elif old.position != cue.position:
+        return False
+
+    same_timing = (abs(old.start - cue.start) <= 0.40 and
+                   abs(old.end - cue.end) <= 0.60)
+    old_text, new_text = normalize_text(old.text), normalize_text(cue.text)
+    text_similarity = ratio(old_text, new_text) if old_text and new_text else 0
+    return same_timing or text_similarity >= 45
+
+
 def _deduplicate_cues(cues, resolution=(1920, 1080)):
-    """Remove overlap duplicates without collapsing distinct on-screen signs."""
+    """Remove overlap duplicates without collapsing distinct on-screen signs.
+
+    Dialogue still requires exact text. OCR signs are matched primarily by
+    timing/location because Gemini can translate the same Japanese differently
+    on a later OCR-only refresh.
+    """
     deduplicated = []
-    x_tolerance = max(24.0, resolution[0] * 0.035)
-    y_tolerance = max(18.0, resolution[1] * 0.035)
+
     for cue in sorted(cues, key=lambda item: (item.start, item.layer)):
         def is_duplicate(old):
-            if old.layer != cue.layer or old.text != cue.text:
-                return False
-            if min(old.end, cue.end) - max(old.start, cue.start) <= 0.25:
+            if old.layer != cue.layer:
                 return False
             if cue.layer:
-                if old.x is None or old.y is None or cue.x is None or cue.y is None:
-                    return old.position == cue.position
-                return abs(old.x - cue.x) <= x_tolerance and abs(old.y - cue.y) <= y_tolerance
-            return True
+                return _same_ocr_sign(old, cue, resolution)
+            return (old.text == cue.text and
+                    min(old.end, cue.end) - max(old.start, cue.start) > 0.25)
 
         if not any(is_duplicate(old) for old in deduplicated):
             deduplicated.append(cue)
@@ -62,6 +89,7 @@ def process_video(video_file, output_path, run_ocr=False, ocr_only=False, use_li
                   runtime=RuntimeConfig(), whisper_model_name="large", device="cuda"):
     cache, manager = CacheStore(), GeminiManager(use_lite)
     cues, resolution, gemini_jobs, whisper_segments = [], (1920, 1080), [], []
+    existing_ocr_cues = []
     media_duration = None
     model, gate = None, None
     is_video = Path(video_file).suffix.lower() in VIDEO_EXTS
@@ -79,6 +107,7 @@ def process_video(video_file, output_path, run_ocr=False, ocr_only=False, use_li
             cues.extend(read_srt(output_path))
         elif output_path.lower().endswith(".ass"):
             cues.extend(read_ass(output_path))
+        existing_ocr_cues = [cue for cue in cues if cue.layer]
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, runtime.gemini_workers)) as pool:
         if not ocr_only:
             audio = load_audio(video_file, cache)
@@ -99,7 +128,13 @@ def process_video(video_file, output_path, run_ocr=False, ocr_only=False, use_li
                 whisper_segments = transcribe_full(audio, video_file, model, cache, gate)
         # OCR starts only after Whisper releases the accelerator, while outstanding Gemini calls continue.
         if (run_ocr or ocr_only) and not runtime.ocr_gpu:
-            ocr_cues, resolution = process_video_signs(video_file, manager, cache, pool, runtime.ocr_gpu)
+            ocr_cues, resolution = process_video_signs(
+                video_file, manager, cache, pool, runtime.ocr_gpu, runtime.ocr_vision_rescue
+            )
+            if existing_ocr_cues:
+                ocr_cues = [cue for cue in ocr_cues
+                            if not any(_same_ocr_sign(old, cue, resolution)
+                                       for old in existing_ocr_cues)]
             cues.extend(ocr_cues)
         used_indices = set()
         for job in gemini_jobs:  # Preserve chunk order even though calls execute concurrently.
@@ -162,7 +197,13 @@ def process_video(video_file, output_path, run_ocr=False, ocr_only=False, use_li
         # GPU OCR runs only after every full/targeted Whisper inference has
         # finished, preventing EasyOCR and Whisper from competing for VRAM.
         if (run_ocr or ocr_only) and runtime.ocr_gpu:
-            ocr_cues, resolution = process_video_signs(video_file, manager, cache, pool, True)
+            ocr_cues, resolution = process_video_signs(
+                video_file, manager, cache, pool, True, runtime.ocr_vision_rescue
+            )
+            if existing_ocr_cues:
+                ocr_cues = [cue for cue in ocr_cues
+                            if not any(_same_ocr_sign(old, cue, resolution)
+                                       for old in existing_ocr_cues)]
             cues.extend(ocr_cues)
     # Overlapping Gemini chunks can repeat the same utterance. OCR also needs
     # deduplication, but two identical signs at different coordinates are real.

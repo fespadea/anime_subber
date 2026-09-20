@@ -65,7 +65,7 @@ def read_ass(path: str):
         fields = raw_line[len("Dialogue:"):].lstrip().split(",", 9)
         if len(fields) != 10:
             continue
-        layer_text, start_text, end_text, _style, _name, _ml, _mr, _mv, _effect, body = fields
+        layer_text, start_text, end_text, _style, _name, _ml, _mr, _mv, effect, body = fields
         try:
             layer = int(layer_text.strip())
             start, end = _ass_seconds(start_text), _ass_seconds(end_text)
@@ -90,7 +90,8 @@ def read_ass(path: str):
             remainder = re.sub(r"\\pos\(-?[0-9.]+,-?[0-9.]+\)|\\an[1-9]|\\fs[0-9.]+", "", tags)
             if not remainder:
                 body = body[override.end():]
-        cues.append(Subtitle(start, end, _ass_unescape(body), position, x, y, layer, font_size))
+        cues.append(Subtitle(start, end, _ass_unescape(body), position, x, y, layer, font_size,
+                             effect.strip() or None))
     return cues
 
 
@@ -157,5 +158,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             override = f"{{\\an{cue.position}}}"
         if cue.font_size is not None:
             override = override[:-1] + f"\\fs{round(cue.font_size)}}}" if override else f"{{\\fs{round(cue.font_size)}}}"
-        events.append(f"Dialogue: {cue.layer},{_ass_time(cue.start)},{_ass_time(cue.end)},{style},,0,0,0,,{override}{_ass_escape(cue.text)}")
+        effect = (cue.effect or "").replace(",", "_")
+        events.append(f"Dialogue: {cue.layer},{_ass_time(cue.start)},{_ass_time(cue.end)},{style},,0,0,0,{effect},{override}{_ass_escape(cue.text)}")
     Path(path).write_text(header + "\n".join(events) + "\n", encoding="utf-8-sig")

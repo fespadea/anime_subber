@@ -45,6 +45,24 @@ def _translation_items(value):
     return items
 
 
+def _vision_items(value):
+    """Validate Gemini image-OCR JSON and normalize numeric IDs."""
+    if not isinstance(value, list):
+        return []
+    items = []
+    for item in value:
+        if not isinstance(item, dict) or "id" not in item:
+            continue
+        try:
+            identifier = int(item["id"])
+        except (TypeError, ValueError):
+            continue
+        japanese = str(item.get("ja", "")).strip()
+        if japanese:
+            items.append({"id": identifier, "ja": japanese})
+    return items
+
+
 class GeminiManager:
     def __init__(self, use_lite: bool = False, client_factory=None):
         # Keep aliases first so normal runs follow Google's supported Flash
@@ -172,6 +190,41 @@ def translate_text_batch(items: Sequence[dict], manager: GeminiManager, prefer_l
     response = manager.generate([prompt], types.GenerateContentConfig(temperature=0.1,
                                 response_mime_type="application/json"), prefer_lite=prefer_lite)
     return _translation_items(parse_llm_json(response.text)) if response else []
+
+
+def recognize_japanese_image_batch(items: Sequence[dict], manager: GeminiManager,
+                                   prefer_lite: bool = False):
+    """Transcribe Japanese from cropped sign images.
+
+    This is deliberately a recognition-only pass. Translation remains in
+    :func:`translate_text_batch`, which keeps OCR tracking/cache data grounded
+    in the Japanese source text instead of an English rendering that may vary
+    between runs.
+    """
+    if not items:
+        return []
+    from google.genai import types
+
+    contents = [(
+        "Transcribe the Japanese text in each cropped image. These crops are "
+        "suspected vertical Japanese (tategaki), although some may be false "
+        "positives. Read characters top-to-bottom within a vertical column and "
+        "read adjacent columns from right to left. Preserve separate vertical "
+        "columns with newline characters in that reading order. Do not translate, "
+        "romanize, or explain the text. If an image has no Japanese text, omit it "
+        "from the result. Return only a JSON array of objects with the exact input "
+        "'id' and a 'ja' key."
+    )]
+    for item in items:
+        contents.append(f"Image id {int(item['id'])}:")
+        contents.append(types.Part.from_bytes(data=item["image_bytes"], mime_type="image/jpeg"))
+
+    response = manager.generate(
+        contents,
+        types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json"),
+        prefer_lite=prefer_lite,
+    )
+    return _vision_items(parse_llm_json(response.text)) if response else []
 
 
 def translate_recovery_slice(audio, media_path: str, start: float, end: float, cache_name: str,
