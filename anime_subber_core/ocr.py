@@ -586,7 +586,7 @@ def _sign_fingerprint(sign):
 
 
 def detect_signs(video_file: str, cache: CacheStore, gpu=False, sample_seconds=1.0,
-                 manager=None, executor=None, vision_rescue=True):
+                 manager=None, executor=None, vision_rescue=False):
     cache_name = f"ocr_signs_{_OCR_CACHE_VERSION}"
     cached = cache.load_json(video_file, cache_name)
     if cached is not None:
@@ -786,7 +786,7 @@ def translate_signs(signs, video_file: str, manager: GeminiManager, cache: Cache
     return [cue for future in futures for cue in future.result()]
 
 
-def process_video_signs(video_file, manager, cache, executor, gpu=False, vision_rescue=True):
+def process_video_signs(video_file, manager, cache, executor, gpu=False, vision_rescue=False):
     signs, resolution = detect_signs(video_file, cache, gpu, manager=manager, executor=executor,
                                      vision_rescue=vision_rescue)
     return translate_signs(signs, video_file, manager, cache, executor), resolution

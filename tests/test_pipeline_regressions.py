@@ -73,6 +73,39 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(len(restored), 1)
             self.assertEqual(restored[0].text, existing.text)
 
+    def test_gemini_input_bypasses_api_video_transcription(self):
+        import json
+
+        class FakeAudio:
+            def __len__(self):
+                return 10_000
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "episode.mkv"
+            video.write_bytes(b"placeholder")
+            gem = root / "gemini.json"
+            gem.write_text(json.dumps({
+                "format": "anime-subber-gem-v1",
+                "cues": [{
+                    "kind": "dialogue", "start": 1.0, "end": 2.5,
+                    "ja": "こんにちは", "en": "Hello."
+                }]
+            }, ensure_ascii=False), encoding="utf-8")
+            output = root / "episode.ass"
+            whisper = [{"text": "こんにちは", "start": 1.2, "end": 2.0, "global_idx": 0}]
+            with patch("anime_subber_core.pipeline.video_resolution", return_value=(1920, 1080)), \
+                 patch("anime_subber_core.pipeline.load_audio", return_value=FakeAudio()), \
+                 patch("anime_subber_core.pipeline.safe_instance_count", return_value=1), \
+                 patch("anime_subber_core.pipeline.load_model", return_value=object()), \
+                 patch("anime_subber_core.pipeline.transcribe_full", return_value=whisper), \
+                 patch("anime_subber_core.pipeline.prepare_gemini_video") as prepare_video:
+                process_video(str(video), str(output), run_ocr=False, gemini_input=str(gem))
+            prepare_video.assert_not_called()
+            restored = read_ass(str(output))
+            self.assertEqual([cue.text for cue in restored], ["Hello."])
+            self.assertAlmostEqual(restored[0].start, 1.2, places=1)
+
 
 if __name__ == "__main__":
     unittest.main()

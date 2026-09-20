@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 
-VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".webm")
+VIDEO_EXTS = (".mp4", ".mkv", ".mpeg", ".mpg", ".avi", ".mov", ".flv", ".webm", ".wmv", ".3gp")
 AUDIO_EXTS = (".mp3", ".wav")
 SUPPORTED_EXTS = VIDEO_EXTS + AUDIO_EXTS
 CHUNK_LENGTH_MS = 4 * 60 * 1000
@@ -16,4 +16,4 @@ class RuntimeConfig:
     whisper_workers: int = 1
     ocr_gpu: bool = False
     strict_timing: bool = False
-    ocr_vision_rescue: bool = True
+    ocr_vision_rescue: bool = False
