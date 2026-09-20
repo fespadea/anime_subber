@@ -17,7 +17,9 @@ This project generates English subtitle tracks by combining Gemini's Japanese tr
   - `layout.py`: temporal/spatial collision resolution for ASS cues.
   - `subtitles.py`: SRT/ASS parsing and writing.
   - `pipeline.py`, `cli.py`: orchestration and CLI.
-- `GEMINI_GEM_INSTRUCTIONS.md`: instructions/schema for a Gemini Gem that can produce direct script input.
+- `GEMINI_GEM_INSTRUCTIONS.md`: exact custom instructions/schema for a Gemini Gem that can produce direct script input.
+- `GEMINI_GEM_GUIDE.md`: end-user setup and usage guide for the Gem workflow.
+- `README.md`: installation, normal CLI usage, and an overview of the Gem workflow.
 - `tests/`: tests that must not call Gemini, Whisper, ffmpeg, or a GPU.
 
 ## Development rules
