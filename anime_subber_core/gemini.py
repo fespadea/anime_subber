@@ -115,8 +115,10 @@ def translate_text_batch(items: Sequence[dict], manager: GeminiManager, prefer_l
     from google.genai import types
     import json
     prompt = (
-        "Translate the Japanese on-screen text to concise English. Return only a JSON array of objects with "
-        "the exact input 'id' and an 'en' key.\n" + json.dumps(items, ensure_ascii=False)
+        "Translate the Japanese on-screen text to concise English. Newlines in Japanese input may separate "
+        "vertical columns that have already been ordered in Japanese reading order (rightmost column first). "
+        "Return only a JSON array of objects with the exact input 'id' and an 'en' key.\n" +
+        json.dumps(items, ensure_ascii=False)
     )
     response = manager.generate([prompt], types.GenerateContentConfig(temperature=0.1,
                                 response_mime_type="application/json"), prefer_lite=prefer_lite)
