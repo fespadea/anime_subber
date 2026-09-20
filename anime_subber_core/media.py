@@ -32,10 +32,15 @@ def load_audio(video_file: str, cache: CacheStore):
                 stderr=subprocess.PIPE,
                 check=True,
                 timeout=AUDIO_EXTRACTION_TIMEOUT_SECONDS,
+                text=True,
             )
             if not os.path.exists(partial) or os.path.getsize(partial) < 44:
                 raise RuntimeError("FFmpeg produced no usable audio")
             os.replace(partial, destination)
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or "").strip().splitlines()
+            message = detail[-1] if detail else "unknown FFmpeg error"
+            raise RuntimeError(f"Audio extraction failed for {video_file}: {message}") from exc
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(
                 f"Audio extraction exceeded {AUDIO_EXTRACTION_TIMEOUT_SECONDS // 60} minutes for {video_file}"

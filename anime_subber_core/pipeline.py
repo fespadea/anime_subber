@@ -4,12 +4,12 @@ from pathlib import Path
 
 from .alignment import align_subtitles
 from .cache import CacheStore
-from .config import ORPHAN_GAP_THRESH_SEC, RuntimeConfig, SUPPORTED_EXTS
+from .config import ORPHAN_GAP_THRESH_SEC, RuntimeConfig, SUPPORTED_EXTS, VIDEO_EXTS
 from .gemini import GeminiManager, submit_audio_chunks, translate_recovery_slice
 from .ocr import process_video_signs
 from .layout import resolve_collisions
 from .media import load_audio
-from .subtitles import read_srt, write_ass, write_srt
+from .subtitles import read_ass, read_srt, write_ass, write_srt
 from .timing import refine_contiguous_starts
 from .whisper_engine import (WhisperGate, load_model, safe_instance_count,
                              bound_segments, transcribe_full, transcribe_targeted)
@@ -36,18 +36,49 @@ def _bound_cues(cues, duration):
     return bounded
 
 
+def _deduplicate_cues(cues, resolution=(1920, 1080)):
+    """Remove overlap duplicates without collapsing distinct on-screen signs."""
+    deduplicated = []
+    x_tolerance = max(24.0, resolution[0] * 0.035)
+    y_tolerance = max(18.0, resolution[1] * 0.035)
+    for cue in sorted(cues, key=lambda item: (item.start, item.layer)):
+        def is_duplicate(old):
+            if old.layer != cue.layer or old.text != cue.text:
+                return False
+            if min(old.end, cue.end) - max(old.start, cue.start) <= 0.25:
+                return False
+            if cue.layer:
+                if old.x is None or old.y is None or cue.x is None or cue.y is None:
+                    return old.position == cue.position
+                return abs(old.x - cue.x) <= x_tolerance and abs(old.y - cue.y) <= y_tolerance
+            return True
+
+        if not any(is_duplicate(old) for old in deduplicated):
+            deduplicated.append(cue)
+    return deduplicated
+
+
 def process_video(video_file, output_path, run_ocr=False, ocr_only=False, use_lite=False,
                   runtime=RuntimeConfig(), whisper_model_name="large", device="cuda"):
     cache, manager = CacheStore(), GeminiManager(use_lite)
     cues, resolution, gemini_jobs, whisper_segments = [], (1920, 1080), [], []
     media_duration = None
     model, gate = None, None
+    is_video = Path(video_file).suffix.lower() in VIDEO_EXTS
+    if ocr_only and not is_video:
+        raise ValueError("--ocr-only requires a video file; OCR is not available for audio-only inputs")
+    if run_ocr and not is_video:
+        print(f"[OCR] Skipping {video_file}: OCR requires a video input.")
+        run_ocr = False
+
     if ocr_only and Path(output_path).exists():
         backup = str(cache.media_dir(video_file) / (Path(output_path).name + ".bak"))
         shutil.copy2(output_path, backup)
         print(f"Backed up existing subtitles to {backup}")
         if output_path.lower().endswith(".srt"):
             cues.extend(read_srt(output_path))
+        elif output_path.lower().endswith(".ass"):
+            cues.extend(read_ass(output_path))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, runtime.gemini_workers)) as pool:
         if not ocr_only:
             audio = load_audio(video_file, cache)
@@ -65,7 +96,7 @@ def process_video(video_file, output_path, run_ocr=False, ocr_only=False, use_li
                     print(f"[Whisper] Capacity probe limited concurrency to {count} instance(s).")
                 model = load_model(whisper_model_name, device)
                 # Gemini calls run while this single full-track Whisper pass executes.
-                whisper_segments = transcribe_full(audio, video_file, model, cache, WhisperGate(count))
+                whisper_segments = transcribe_full(audio, video_file, model, cache, gate)
         # OCR starts only after Whisper releases the accelerator, while outstanding Gemini calls continue.
         if (run_ocr or ocr_only) and not runtime.ocr_gpu:
             ocr_cues, resolution = process_video_signs(video_file, manager, cache, pool, runtime.ocr_gpu)
@@ -133,15 +164,9 @@ def process_video(video_file, output_path, run_ocr=False, ocr_only=False, use_li
         if (run_ocr or ocr_only) and runtime.ocr_gpu:
             ocr_cues, resolution = process_video_signs(video_file, manager, cache, pool, True)
             cues.extend(ocr_cues)
-    # Overlapping Gemini chunks can repeat the same utterance. Keep the best
-    # first cue when normalized text and timing substantially overlap.
-    deduplicated = []
-    for cue in sorted(cues, key=lambda item: (item.start, item.layer)):
-        duplicate = next((old for old in deduplicated if old.text == cue.text and
-                          min(old.end, cue.end) - max(old.start, cue.start) > 0.25), None)
-        if duplicate is None:
-            deduplicated.append(cue)
-    cues = deduplicated
+    # Overlapping Gemini chunks can repeat the same utterance. OCR also needs
+    # deduplication, but two identical signs at different coordinates are real.
+    cues = _deduplicate_cues(cues, resolution)
     if media_duration is not None:
         cues = _bound_cues(cues, media_duration)
     if runtime.strict_timing and not ocr_only:
@@ -154,10 +179,18 @@ def process_video(video_file, output_path, run_ocr=False, ocr_only=False, use_li
     print(f"Saved {len(cues)} subtitle cues to {output_path}")
 
 
-def process_target(target, output_format="srt", run_ocr=False, ocr_only=False, force_update=False,
+def process_target(target, output_format="ass", run_ocr=False, ocr_only=False, force_update=False,
                    use_lite=False, runtime=RuntimeConfig(), model="large", device="cuda"):
     path = Path(target)
-    files = [path] if path.is_file() else [p for p in path.rglob("*") if p.suffix.lower() in SUPPORTED_EXTS]
+    if not path.exists():
+        raise FileNotFoundError(f"Input path does not exist: {path}")
+    files = [path] if path.is_file() else sorted(
+        (p for p in path.rglob("*") if p.suffix.lower() in SUPPORTED_EXTS),
+        key=lambda item: str(item).casefold(),
+    )
+    if not files:
+        print(f"No supported media files found under {path}")
+        return
     for media in files:
         if media.suffix.lower() not in SUPPORTED_EXTS:
             continue

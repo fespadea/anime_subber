@@ -3,7 +3,8 @@ from dataclasses import dataclass
 from typing import Iterable, List, Tuple
 
 from .models import Subtitle
-from .styling import dialogue_font_size, minimum_ocr_font_size, ocr_font_size
+from .styling import (dialogue_font_size, dialogue_margin,
+                      minimum_ocr_font_size, ocr_font_size)
 
 
 PADDING = 7.0
@@ -51,7 +52,8 @@ def _rect(cue: Subtitle, resolution: Tuple[int, int]) -> Rect:
         x = cue.x if cue.x is not None else resolution[0] / 2
         y = cue.y if cue.y is not None else resolution[1] / 2
     else:
-        x, y = resolution[0] / 2, resolution[1] - 55 - height / 2
+        x = resolution[0] / 2
+        y = resolution[1] - dialogue_margin(resolution) - height / 2
     return Rect(x - width / 2, y - height / 2, x + width / 2, y + height / 2)
 
 

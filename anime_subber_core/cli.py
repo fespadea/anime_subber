@@ -11,11 +11,13 @@ def build_parser():
     ocr_group.add_argument("--ocr", dest="ocr", action="store_true", help="Enable OCR (default)")
     ocr_group.add_argument("--no-ocr", "--no_ocr", dest="ocr", action="store_false", help="Disable OCR")
     parser.set_defaults(ocr=True)
-    parser.add_argument("--ocr-only", "--ocr_only", dest="ocr_only", action="store_true")
+    parser.add_argument("--ocr-only", "--ocr_only", dest="ocr_only", action="store_true",
+                        help="Run only on-screen text OCR; preserve cues from an existing output file")
     parser.add_argument("--strict-timing", "--strict_timing", dest="strict_timing", action="store_true",
                         help="Trim leading quiet audio from contiguous cues")
-    parser.add_argument("--lite", action="store_true")
-    parser.add_argument("--force-update", "--force_update", dest="force_update", action="store_true")
+    parser.add_argument("--lite", action="store_true", help="Prefer Gemini lite models")
+    parser.add_argument("--force-update", "--force_update", dest="force_update", action="store_true",
+                        help="Regenerate the subtitle file even if it already exists (model caches are still reused)")
     parser.add_argument("--format", choices=("srt", "ass"), default="ass",
                         help="Output format (default: ass)")
     parser.add_argument("--gemini-workers", "--gemini_workers", dest="gemini_workers", type=int, default=4)

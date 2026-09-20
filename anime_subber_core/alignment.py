@@ -35,6 +35,40 @@ def _character_timeline(segments: Sequence[dict]) -> List[_TimedCharacter]:
         if not normalized:
             continue
         start, end = float(segment.get("start", 0)), float(segment.get("end", 0))
+        words = segment.get("words") or []
+        word_characters = []
+        for word in words:
+            value = normalize_text(str(word.get("word", ""))) if isinstance(word, dict) else ""
+            if not value:
+                continue
+            try:
+                word_start = max(start, float(word.get("start", start)))
+                word_end = min(end, float(word.get("end", end)))
+            except (TypeError, ValueError):
+                continue
+            if word_end <= word_start:
+                continue
+            duration = word_end - word_start
+            for offset, character in enumerate(value):
+                word_characters.append(_TimedCharacter(
+                    character, segment_index,
+                    word_start + duration * offset / len(value),
+                    word_start + duration * (offset + 1) / len(value),
+                ))
+
+        # Whisper was explicitly asked for word timestamps. Use them when the
+        # timestamped units both cover most of the segment and still agree with
+        # Whisper's segment text after normalization. Japanese "words" are not
+        # necessarily linguistic words, but their local start/end times are the
+        # useful signal here. Fall back to segment-level interpolation for old,
+        # partial, or internally inconsistent Whisper output.
+        word_text = "".join(character.value for character in word_characters)
+        coverage = len(word_text) / max(1, len(normalized))
+        agreement = ratio(normalized, word_text) if word_text else 0
+        if 0.65 <= coverage <= 1.35 and agreement >= 78:
+            timeline.extend(word_characters)
+            continue
+
         duration = max(0.05, end - start)
         for offset, character in enumerate(normalized):
             timeline.append(_TimedCharacter(character, segment_index,
@@ -66,7 +100,7 @@ def _length_options(target_length: int, remaining: int):
     return sorted(value for value in values if 1 <= value <= remaining)
 
 
-def _candidates(index: int, line: dict, timeline: Sequence[_TimedCharacter], limit=120):
+def _candidates(index: int, line: dict, timeline: Sequence[_TimedCharacter], limit=120, max_span=5):
     target = normalize_text(str(line.get("ja", "")))
     if not target:
         return []
@@ -77,6 +111,8 @@ def _candidates(index: int, line: dict, timeline: Sequence[_TimedCharacter], lim
             end = start + length
             score = _score(target, text[start:end])
             crossed_boundaries = timeline[end - 1].segment - timeline[start].segment
+            if crossed_boundaries + 1 > max_span:
+                continue
             if crossed_boundaries:
                 score -= 0.08 * crossed_boundaries
             if score >= 0.43:
@@ -92,7 +128,7 @@ def global_monotonic_matches(gemini_lines: Sequence[dict], whisper_segments: Seq
     timeline = _character_timeline(whisper_segments)
     states = [(0, 0.0, tuple())]
     for index, line in enumerate(gemini_lines):
-        candidates = _candidates(index, line, timeline)
+        candidates = _candidates(index, line, timeline, max_span=max_span)
         next_by_end = {}
         for consumed, total, path in states:
             skipped = (consumed, total - 0.24, path)

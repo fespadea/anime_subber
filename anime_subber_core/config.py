@@ -1,7 +1,9 @@
 from dataclasses import dataclass
 
 
-SUPPORTED_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".webm", ".mp3", ".wav")
+VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".webm")
+AUDIO_EXTS = (".mp3", ".wav")
+SUPPORTED_EXTS = VIDEO_EXTS + AUDIO_EXTS
 CHUNK_LENGTH_MS = 4 * 60 * 1000
 OVERLAP_MS = 30 * 1000
 STEP_MS = CHUNK_LENGTH_MS - OVERLAP_MS

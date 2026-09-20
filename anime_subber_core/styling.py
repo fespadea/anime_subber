@@ -28,3 +28,13 @@ def ocr_font_size(resolution: Tuple[int, int]) -> float:
 def minimum_ocr_font_size(resolution: Tuple[int, int]) -> float:
     return max(10.0 * SUBTITLE_SIZE_SCALE,
                14.0 * resolution_scale(resolution) * SUBTITLE_SIZE_SCALE)
+
+
+def dialogue_margin(resolution: Tuple[int, int]) -> int:
+    """ASS dialogue vertical/side margin in script-resolution pixels."""
+    return round(max(16, 40 * resolution_scale(resolution)))
+
+
+def sign_margin(resolution: Tuple[int, int]) -> int:
+    """ASS sign fallback margin in script-resolution pixels."""
+    return round(max(10, 20 * resolution_scale(resolution)))

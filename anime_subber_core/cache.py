@@ -32,8 +32,18 @@ class CacheStore:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def media_dir(self, media_path: str) -> Path:
-        resolved = str(Path(media_path).resolve())
-        digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
+        media = Path(media_path).resolve()
+        resolved = str(media)
+        # Path alone distinguishes same-named files in different directories but
+        # not a media file that is replaced in place. Size + nanosecond mtime make
+        # cached model output follow the actual source revision without hashing a
+        # multi-gigabyte video on every run.
+        try:
+            stat = media.stat()
+            identity = f"{resolved}\0{stat.st_size}\0{stat.st_mtime_ns}"
+        except OSError:
+            identity = resolved
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
         safe_stem = "".join(c if c.isalnum() or c in "-_" else "_" for c in Path(media_path).stem)[:80]
         path = self.root / f"{safe_stem}-{digest}"
         path.mkdir(parents=True, exist_ok=True)
@@ -49,6 +59,9 @@ class CacheStore:
             legacy = Path(str(Path(media_path).with_suffix("")) + f".{name}.json")
             if legacy.exists():
                 try:
+                    media = Path(media_path)
+                    if media.exists() and legacy.stat().st_mtime_ns < media.stat().st_mtime_ns:
+                        return None
                     with legacy.open("r", encoding="utf-8") as stream:
                         value = json.load(stream)
                     self.save_json(media_path, name, value)

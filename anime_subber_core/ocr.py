@@ -16,8 +16,9 @@ _LATIN = re.compile(r"[A-Za-z]")
 
 
 # OCR cache versions are intentionally tied to the detection/layout algorithm.
-# v5 adds vertical Japanese reconstruction and right-to-left column ordering.
-_OCR_CACHE_VERSION = "v5"
+# v6 adds vertical Japanese reconstruction/right-to-left column ordering and
+# Unicode-aware normalization for more stable frame-to-frame matching.
+_OCR_CACHE_VERSION = "v6"
 
 
 def contains_japanese(text: str) -> bool:
@@ -421,7 +422,17 @@ def translate_signs(signs, video_file: str, manager: GeminiManager, cache: Cache
             data = translate_text_batch([{"id": i, "ja": sign["ja_text"]} for i, sign in enumerate(batch)], manager)
             if data:
                 cache.save_json(video_file, name, data)
-        mapping = {item.get("id"): item.get("en", "") for item in data if isinstance(item, dict)}
+        mapping = {}
+        for item in data if isinstance(data, list) else []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                identifier = int(item.get("id"))
+            except (TypeError, ValueError):
+                continue
+            english = str(item.get("en", "")).strip()
+            if english:
+                mapping[identifier] = english
         return [Subtitle(float(sign["start"]), float(sign["end"]), f"[{mapping[i]}]",
                          int(sign["pos"]), float(sign["x"]), float(sign["y"]), 1)
                 for i, sign in enumerate(batch) if mapping.get(i)]
